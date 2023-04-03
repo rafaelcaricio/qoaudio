@@ -1,4 +1,4 @@
-# QOA - Pure Rust
+# QOA - The Quite Ok Audio Format
 
 This is a pure Rust (zero dependency) implementation of the [QOA](https://qoaformat.org) audio format.
 

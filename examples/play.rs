@@ -1,4 +1,4 @@
-use qoa::QoaDecoder;
+use qoaudio::QoaDecoder;
 use rodio::{OutputStream, Sink};
 use std::fs::File;
 use std::io::Read;
