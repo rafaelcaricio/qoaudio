@@ -11,3 +11,5 @@ cargo run --release --example play --features="rodio" -- fixtures/julien_baker_s
 ```
 We need to enable the `rodio` feature to play the audio. It is not a direct dependency of this crate, but we implement
 integration with `rodio` for playback capability.
+
+More audio samples can be found at [phoboslab.org/files/qoa-samples](https://phoboslab.org/files/qoa-samples/).
