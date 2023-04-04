@@ -134,8 +134,9 @@ impl QoaDecoder {
         sample_data.into()
     }
 
-    fn decode_frame(&mut self, bytes: &[u8], samples_data: &mut [i16]) -> (usize, usize) {
+    pub fn decode_frame(&mut self, bytes: &[u8], samples_data: &mut [i16]) -> (usize, usize) {
         if bytes.len() < 8 + QOA_LMS_LEN * 4 * self.channels as usize {
+            // TODO: Error with not enough bytes to read the frame header
             return (0, 0);
         }
 
@@ -154,15 +155,16 @@ impl QoaDecoder {
             || frame_size > bytes.len()
             || total_samples * self.channels as usize > max_total_samples
         {
+            // TODO: Error with invalid frame header, incompatible with the decoder metadata
             return (0, 0);
         }
 
         // Read the LMS state: 4 x 2 bytes history, 4 x 2 bytes weights per channel
-        let mut p = 8;
+        let mut processed_bytes = 8;
         for c in 0..self.channels as usize {
-            let mut history = u64::from_be_bytes(bytes[p..p + 8].try_into().unwrap());
-            let mut weights = u64::from_be_bytes(bytes[p + 8..p + 16].try_into().unwrap());
-            p += 16;
+            let mut history = u64::from_be_bytes(bytes[processed_bytes..processed_bytes + 8].try_into().unwrap());
+            let mut weights = u64::from_be_bytes(bytes[processed_bytes + 8..processed_bytes + 16].try_into().unwrap());
+            processed_bytes += 16;
 
             for i in 0..QOA_LMS_LEN {
                 self.lms[c].history[i] = ((history >> 48) as i16) as i32;
@@ -172,8 +174,8 @@ impl QoaDecoder {
             }
         }
 
-        let (frame_len, decoded_bytes) = self.decode_slices(bytes, p, total_samples, samples_data);
-        (frame_len, decoded_bytes + p)
+        let (frame_len, decoded_bytes) = self.decode_slices(bytes, processed_bytes, total_samples, samples_data);
+        (frame_len, decoded_bytes + processed_bytes)
     }
 
     fn decode_slices(
@@ -183,12 +185,19 @@ impl QoaDecoder {
         total_samples: usize,
         samples_data: &mut [i16],
     ) -> (usize, usize) {
-        let mut p = start;
+        if samples_data.len() < total_samples {
+            // TODO: Error with not enough space to store the decoded samples
+            return (0, 0);
+        }
+
+        // The bytes is the full frame, so we need to skip the header which the start parameter
+        // indicated the start of the slices part of the data.
+        let mut processed_bytes = start;
         let mut sample_index = 0;
 
-        while sample_index < total_samples && p + 8 < bytes.len() {
+        while sample_index < total_samples && processed_bytes + 8 < bytes.len() {
             for c in 0..self.channels as usize {
-                let mut slice = u64::from_be_bytes(bytes[p..p + 8].try_into().unwrap());
+                let mut slice = u64::from_be_bytes(bytes[processed_bytes..processed_bytes + 8].try_into().unwrap());
 
                 let scale_factor = ((slice >> 60) & 0xf) as i32;
                 let slice_end =
@@ -207,13 +216,15 @@ impl QoaDecoder {
                     self.lms[c].update(reconstructed, dequantized);
                 }
 
-                p += 8;
+                processed_bytes += 8;
             }
 
             sample_index += QOA_SLICE_LEN;
         }
 
-        (sample_index, p - start)
+        // Returns the number of samples processed and the total amount of bytes processed
+        // since we started at the start index, we subtract it to get the total.
+        (sample_index, processed_bytes - start)
     }
 }
 

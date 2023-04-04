@@ -17,7 +17,7 @@ fn main() {
     let qoa = QoaDecoder::new(&bytes).unwrap();
     println!("Decoded header:");
     println!("\tchannels: {}", qoa.channels());
-    println!("\tsamplerate: {}", qoa.sample_rate());
+    println!("\tsample rate: {}", qoa.sample_rate());
     println!("\tsamples: {}", qoa.samples());
     println!("\tDuration: {:?}", qoa.duration());
 
