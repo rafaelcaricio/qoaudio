@@ -23,6 +23,21 @@ pub enum ProcessingMode {
     Streaming,
 }
 
+impl ProcessingMode {
+    pub fn duration(&self) -> Option<Duration> {
+        match self {
+            ProcessingMode::FixedSamples {
+                channels: _channels,
+                sample_rate,
+                samples,
+            } => Some(Duration::from_secs_f64(
+                (*samples as f64) / (*sample_rate as f64),
+            )),
+            ProcessingMode::Streaming => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QoaDecoder {
     mode: ProcessingMode,
@@ -89,7 +104,7 @@ impl QoaDecoder {
         &self.mode
     }
 
-    pub fn decode_frames(&mut self, bytes: &[u8]) -> Vec<Frame> {
+    pub fn decode_frames(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, DecodeError> {
         // Check if we begin with the header, if so skip it. Otherwise, assume
         // we are already at the start of the first frame.
         let mut already_processed_bytes = if bytes.len() >= QOA_MIN_FILESIZE {
@@ -105,21 +120,19 @@ impl QoaDecoder {
 
         let mut decoded_frames = Vec::new();
         while already_processed_bytes < bytes.len() {
-            let Some((sample_data, frame_size)) = self.decode_frame(&bytes[already_processed_bytes..]) else {
-                continue;
-            };
+            let (sample_data, frame_size) = self.decode_frame(&bytes[already_processed_bytes..])?;
 
             already_processed_bytes += frame_size;
             decoded_frames.push(sample_data);
         }
 
-        decoded_frames
+        Ok(decoded_frames)
     }
 
-    fn decode_frame(&mut self, bytes: &[u8]) -> Option<(Frame, usize)> {
+    fn decode_frame(&mut self, bytes: &[u8]) -> Result<(Frame, usize), DecodeError> {
         if bytes.len() < QOA_HEADER_SIZE {
-            // TODO: Error with not enough bytes to read the frame header
-            return None;
+            // Error with not enough bytes to read the frame header
+            return Err(DecodeError::NotEnoughBytes);
         }
 
         let frame_header = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -129,8 +142,8 @@ impl QoaDecoder {
         let frame_size = (frame_header & 0x00ffff) as usize;
 
         if bytes.len() < 8 + QOA_LMS_LEN * 4 * channels as usize {
-            // TODO: Error with not enough bytes to decode the frame
-            return None;
+            // Error with not enough bytes to decode the frame
+            return Err(DecodeError::NotEnoughBytes);
         }
 
         let data_size = frame_size - 8 - QOA_LMS_LEN * 4 * channels as usize;
@@ -144,14 +157,13 @@ impl QoaDecoder {
         } = self.mode
         {
             if channels != decoded_channels || sample_rate != decoded_sample_rate {
-                // TODO: Error with invalid frame header, incompatible with the decoder metadata
-                return None;
+                // Error with invalid frame header, incompatible with the decoder metadata
+                return Err(DecodeError::IncompatibleFrame);
             }
         }
 
         if frame_size > bytes.len() || total_samples * channels as usize > max_total_samples {
-            // TODO: Error with invalid frame header, incompatible with the decoder metadata
-            return None;
+            return Err(DecodeError::InvalidHeader);
         }
 
         let mut frame = Frame {
@@ -170,8 +182,8 @@ impl QoaDecoder {
                 channels as usize
             ];
         } else if self.lms.len() != channels as usize {
-            // TODO: Error with invalid number of channels in non-streaming mode
-            return None;
+            // Error with invalid number of channels in non-streaming mode
+            return Err(DecodeError::InvalidHeader);
         }
 
         // Read the LMS state: 4 x 2 bytes history, 4 x 2 bytes weights per channel
@@ -198,7 +210,7 @@ impl QoaDecoder {
         }
 
         let decoded_bytes = self.decode_slices(bytes, processed_bytes, &mut frame);
-        Some((frame, decoded_bytes + processed_bytes))
+        Ok((frame, decoded_bytes + processed_bytes))
     }
 
     fn decode_slices(&mut self, bytes: &[u8], start: usize, frame: &mut Frame) -> usize {
@@ -319,6 +331,8 @@ pub enum DecodeError {
     NotQoaFile,
     NoSamples,
     InvalidHeader,
+    NotEnoughBytes,
+    IncompatibleFrame,
 }
 
 impl std::error::Error for DecodeError {}
@@ -332,6 +346,8 @@ impl Display for DecodeError {
             DecodeError::NotQoaFile => write!(f, "File is not a qoa file"),
             DecodeError::NoSamples => write!(f, "File has no samples"),
             DecodeError::InvalidHeader => write!(f, "File has invalid header"),
+            DecodeError::NotEnoughBytes => write!(f, "Not enough bytes to decode"),
+            DecodeError::IncompatibleFrame => write!(f, "Incompatible frame header"),
         }
     }
 }
@@ -346,9 +362,6 @@ impl Iterator for DecodedAudio {
     type Item = i16;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.samples.is_empty() {
-            return None;
-        }
         self.samples.pop_front()
     }
 }
@@ -441,7 +454,7 @@ mod tests {
             }
         ));
 
-        let audio = qoa.decode_frames(qoa_bytes);
+        let audio = qoa.decode_frames(qoa_bytes).unwrap();
         assert!(!audio.is_empty());
         assert_eq!(audio[0].channels(), 2);
         assert_eq!(audio[0].sample_rate(), 44100);
