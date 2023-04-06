@@ -321,7 +321,7 @@ impl Frame {
     }
 
     pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(self.samples.len() as f64 / self.sample_rate as f64)
+        Duration::from_secs_f64(self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64)
     }
 }
 
@@ -408,7 +408,7 @@ impl DecodedAudio {
     }
 
     pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(self.samples.len() as f64 / self.sample_rate as f64)
+        Duration::from_secs_f64(self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64)
     }
 }
 
@@ -462,6 +462,6 @@ mod tests {
         let audio = DecodedAudio::try_from(audio).unwrap();
         assert_eq!(audio.channels(), 2);
         assert_eq!(audio.sample_rate(), 44100);
-        assert_eq!(audio.duration(), Duration::from_secs_f64(108.576961451));
+        assert_eq!(audio.duration(), Duration::from_secs_f64(54.288480726));
     }
 }

@@ -15,6 +15,7 @@ fn main() {
     file.read_to_end(&mut bytes).unwrap();
 
     let mut qoa = QoaDecoder::decode_header(&bytes).unwrap();
+    // let mut qoa = QoaDecoder::streaming();
     let audio: DecodedAudio = qoa.decode_frames(&bytes).unwrap().try_into().unwrap();
     println!("Decoded header:");
     println!("\tchannels: {}", audio.channels());
