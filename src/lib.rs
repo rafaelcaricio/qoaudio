@@ -7,12 +7,11 @@ use std::collections::VecDeque;
 use std::fmt::Display;
 use std::time::Duration;
 
-const QOA_MIN_FILESIZE: usize = 16;
-
-const QOA_SLICE_LEN: usize = 20;
-const QOA_HEADER_SIZE: usize = 8;
-const QOA_LMS_LEN: usize = 4;
-const QOA_MAGIC: u32 = 0x716f6166; // "qoaf"
+pub const QOA_MIN_FILESIZE: usize = 16;
+pub const QOA_SLICE_LEN: usize = 20;
+pub const QOA_LMS_LEN: usize = 4;
+pub const QOA_HEADER_SIZE: usize = 8;
+pub const QOA_MAGIC: u32 = u32::from_be_bytes(*b"qoaf");
 
 #[derive(Debug, Clone)]
 pub enum ProcessingMode {
@@ -303,6 +302,10 @@ impl Frame {
 
     pub fn samples(&self) -> &[i16] {
         &self.samples
+    }
+
+    pub fn duration(&self) -> Duration {
+        Duration::from_secs_f64(self.samples.len() as f64 / self.sample_rate as f64)
     }
 }
 
