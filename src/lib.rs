@@ -36,6 +36,13 @@ struct QoaLms {
 }
 
 impl QoaDecoder {
+    pub fn streaming() -> Self {
+        Self {
+            mode: ProcessingMode::Streaming,
+            lms: Vec::new(),
+        }
+    }
+
     pub fn decode_header(bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() < QOA_MIN_FILESIZE {
             return Err(DecodeError::LessThanMinimumFileSize);
@@ -65,10 +72,7 @@ impl QoaDecoder {
 
         if samples == 0 {
             // Indicates we are in streaming mode.
-            Ok(Self {
-                mode: ProcessingMode::Streaming,
-                lms,
-            })
+            Ok(Self::streaming())
         } else {
             Ok(Self {
                 mode: ProcessingMode::FixedSamples {
