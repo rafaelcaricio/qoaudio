@@ -321,7 +321,9 @@ impl Frame {
     }
 
     pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64)
+        Duration::from_secs_f64(
+            self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64,
+        )
     }
 }
 
@@ -408,7 +410,9 @@ impl DecodedAudio {
     }
 
     pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64)
+        Duration::from_secs_f64(
+            self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64,
+        )
     }
 }
 
