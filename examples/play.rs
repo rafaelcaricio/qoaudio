@@ -1,7 +1,5 @@
-use qoaudio::{DecodedAudio, QoaDecoder};
-use rodio::{OutputStream, Sink};
-use std::fs::File;
-use std::io::Read;
+use qoaudio::{QoaDecoder, QoaRodioSource};
+use rodio::{OutputStream, Sink, Source};
 use std::thread::sleep;
 
 fn main() {
@@ -10,23 +8,19 @@ fn main() {
         return;
     };
 
-    let mut bytes = Vec::new();
-    let mut file = File::open(audio_path).unwrap();
-    file.read_to_end(&mut bytes).unwrap();
+    let decoder = QoaDecoder::open(audio_path).expect("open file");
+    let audio = QoaRodioSource::new(decoder);
 
-    let mut qoa = QoaDecoder::decode_header(&bytes).unwrap();
-    // let mut qoa = QoaDecoder::streaming();
-    let audio: DecodedAudio = qoa.decode_frames(&bytes).unwrap().try_into().unwrap();
     println!("Decoded header:");
     println!("\tchannels: {}", audio.channels());
     println!("\tsample rate: {}", audio.sample_rate());
-    println!("\tDuration: {:?}", audio.duration());
+    println!("\tDuration: {:?}", audio.total_duration());
 
     let (_stream, stream_handle) = OutputStream::try_default().unwrap();
     let sink = Sink::try_new(&stream_handle).unwrap();
 
     println!("Playing...");
-    let dur = audio.duration();
+    let dur = audio.total_duration().unwrap();
     sink.append(audio);
     sleep(dur);
 }

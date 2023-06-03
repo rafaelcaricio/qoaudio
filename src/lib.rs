@@ -2,30 +2,127 @@
 //! # QOA - Quite OK Audio Format
 //!
 //! A library for decoding qoa files.
-//!
-use std::collections::VecDeque;
 use std::fmt::Display;
+use std::io::Read;
 use std::time::Duration;
 
-pub const QOA_MIN_FILESIZE: usize = 16;
 pub const QOA_SLICE_LEN: usize = 20;
 pub const QOA_LMS_LEN: usize = 4;
 pub const QOA_HEADER_SIZE: usize = 8;
 pub const QOA_MAGIC: u32 = u32::from_be_bytes(*b"qoaf");
 
+/// The decoding mode of the QOA file.
 #[derive(Debug, Clone)]
 pub enum ProcessingMode {
+    /// Total number of samples is known and sample rate and number of channels
+    /// is fixed for the entire file.
     FixedSamples {
-        channels: u32,
+        channels: u8,
         sample_rate: u32,
         samples: u32,
     },
+    /// Total number of samples is not known and the sample rate and number of
+    /// channels can change each frame.
     Streaming,
 }
 
-impl ProcessingMode {
-    pub fn duration(&self) -> Option<Duration> {
-        match self {
+/// Decoder of QOA files.
+///
+/// Decoded samples are obtained by calling [`QoaDecoder::next`]. This is a
+/// streaming decoder. It reads bytes in small chunks as needed. Memory
+/// consumption per channel is less than 100 bytes.
+///
+/// ## Details
+///
+/// While the spec requires a valid QOA file to have all but the last frame to
+/// have all 256 slices, this decoder will accept partial interior frames
+/// without error.
+#[derive(Debug)]
+pub struct QoaDecoder<R> {
+    mode: ProcessingMode,
+    lms: Vec<QoaLms>,
+    reader: R,
+    current_frame: CurrentFrame,
+    pending_samples: Box<[i16]>,
+    next_pending_sample_idx: usize,
+    returned_first_frame_header: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QoaLms {
+    history: [i32; QOA_LMS_LEN],
+    weights: [i32; QOA_LMS_LEN],
+}
+
+impl<R> QoaDecoder<R>
+where
+    R: Read,
+{
+    /// Read the file header and first frame header of a QOA file read from
+    /// `reader`.
+    ///
+    /// QoaDecoder makes many small reads so wrapping a `File` with a
+    /// `BufReader` is recommend. This is done automatically when using
+    /// [`QoaDecoder::open`].
+    pub fn new(mut reader: R) -> Result<Self, DecodeError> {
+        let magic = read_u32_be(&mut reader)?;
+        if magic != QOA_MAGIC {
+            return Err(DecodeError::NotQoaFile);
+        }
+
+        let samples = read_u32_be(&mut reader)?;
+        let mode = if samples == 0 {
+            // Indicates we are in streaming mode.
+            ProcessingMode::Streaming
+        } else {
+            ProcessingMode::FixedSamples {
+                // replaced on first call to decode_frame_header_and_lms below
+                channels: 0,
+                sample_rate: 0,
+                samples,
+            }
+        };
+
+        // replaced on first call to decode_frame_header_and_lms below
+        let current_frame: CurrentFrame = Default::default();
+
+        let mut to_return = Self {
+            mode,
+            lms: Vec::new(),
+            reader,
+            current_frame,
+            pending_samples: Box::new([]),
+            next_pending_sample_idx: 0,
+            returned_first_frame_header: false,
+        };
+        let found_frame = to_return.decode_frame_header_and_lms(true)?;
+        if !found_frame {
+            return Err(DecodeError::NoSamples);
+        }
+        Ok(to_return)
+    }
+
+    /// Consume this `QoaDecoder` and return the inner reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
+    /// Returns if the decoder is streaming (i.e. total number of samples are
+    /// not known and sample rate and number of channels can change each frame)
+    /// or fixed (i.e. total number of samples are known and sample rate and
+    /// number of channels does not change).
+    pub fn mode(&self) -> &ProcessingMode {
+        &self.mode
+    }
+
+    /// The header of the frame currently being processed (i.e. most recently
+    /// returned from next).
+    pub fn current_frame_header(&self) -> &FrameHeader {
+        &self.current_frame.header
+    }
+
+    pub fn total_duration(&self) -> Option<Duration> {
+        match &self.mode {
             ProcessingMode::FixedSamples {
                 channels: _channels,
                 sample_rate,
@@ -36,170 +133,69 @@ impl ProcessingMode {
             ProcessingMode::Streaming => None,
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct QoaDecoder {
-    mode: ProcessingMode,
-    lms: Vec<QoaLms>,
-}
-
-#[derive(Debug, Clone)]
-struct QoaLms {
-    history: [i32; QOA_LMS_LEN],
-    weights: [i32; QOA_LMS_LEN],
-}
-
-impl QoaDecoder {
-    pub fn streaming() -> Self {
-        Self {
-            mode: ProcessingMode::Streaming,
-            lms: Vec::new(),
-        }
-    }
-
-    pub fn decode_header(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < QOA_MIN_FILESIZE {
-            return Err(DecodeError::LessThanMinimumFileSize);
-        }
-
-        let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-        if magic != QOA_MAGIC {
-            return Err(DecodeError::NotQoaFile);
-        }
-
-        let samples = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
-        let frame_header = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let channels = ((frame_header >> 56) & 0x0000ff) as u32;
-        let sample_rate = ((frame_header >> 32) & 0xffffff) as u32;
-
-        if channels == 0 || sample_rate == 0 {
-            return Err(DecodeError::InvalidHeader);
-        }
-
-        let lms = vec![
-            QoaLms {
-                history: [0; QOA_LMS_LEN],
-                weights: [0; QOA_LMS_LEN],
-            };
-            channels as usize
-        ];
-
-        if samples == 0 {
-            // Indicates we are in streaming mode.
-            Ok(Self::streaming())
-        } else {
-            Ok(Self {
-                mode: ProcessingMode::FixedSamples {
-                    channels,
-                    sample_rate,
-                    samples,
-                },
-                lms,
-            })
-        }
-    }
-
-    pub fn mode(&self) -> &ProcessingMode {
-        &self.mode
-    }
-
-    pub fn decode_frames(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, DecodeError> {
-        // Check if we begin with the header, if so skip it. Otherwise, assume
-        // we are already at the start of the first frame.
-        let mut already_processed_bytes = if bytes.len() >= QOA_MIN_FILESIZE {
-            let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-            if magic == QOA_MAGIC {
-                QOA_HEADER_SIZE
-            } else {
-                0
+    /// Returns Ok(true) if a frame was read. Returns Ok(false) if EOF was
+    /// encountered before any bytes were read.
+    fn decode_frame_header_and_lms(&mut self, first: bool) -> Result<bool, DecodeError> {
+        let frame_header = read_u64_be(&mut self.reader);
+        let frame_header = match frame_header {
+            Ok(h) => h,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    // This is expected.
+                    return Ok(false);
+                } else {
+                    return Err(e.into());
+                }
             }
-        } else {
-            0
+        };
+        let num_channels = ((frame_header >> 56) & 0x0000ff) as u8;
+        let sample_rate = ((frame_header >> 32) & 0xffffff) as u32;
+        let num_samples_per_channel = ((frame_header >> 16) & 0x00ffff) as u16;
+        let frame_size = (frame_header & 0x00ffff) as u16;
+        let frame_header = FrameHeader {
+            num_channels,
+            sample_rate,
+            num_samples_per_channel,
         };
 
-        let mut decoded_frames = Vec::new();
-        while already_processed_bytes < bytes.len() {
-            let (sample_data, frame_size) = self.decode_frame(&bytes[already_processed_bytes..])?;
-
-            already_processed_bytes += frame_size;
-            decoded_frames.push(sample_data);
-        }
-
-        Ok(decoded_frames)
-    }
-
-    fn decode_frame(&mut self, bytes: &[u8]) -> Result<(Frame, usize), DecodeError> {
-        if bytes.len() < QOA_HEADER_SIZE {
-            // Error with not enough bytes to read the frame header
-            return Err(DecodeError::NotEnoughBytes);
-        }
-
-        let frame_header = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-        let channels = ((frame_header >> 56) & 0x0000ff) as u32;
-        let sample_rate = ((frame_header >> 32) & 0xffffff) as u32;
-        let total_samples = ((frame_header >> 16) & 0x00ffff) as usize;
-        let frame_size = (frame_header & 0x00ffff) as usize;
-
-        if bytes.len() < 8 + QOA_LMS_LEN * 4 * channels as usize {
-            // Error with not enough bytes to decode the frame
-            return Err(DecodeError::NotEnoughBytes);
-        }
-
-        let data_size = frame_size - 8 - QOA_LMS_LEN * 4 * channels as usize;
+        const LMS_SIZE: usize = 4;
+        let data_size =
+            frame_size as usize - QOA_HEADER_SIZE - QOA_LMS_LEN * LMS_SIZE * num_channels as usize;
         let num_slices = data_size / 8;
-        let max_total_samples = num_slices * QOA_SLICE_LEN;
+
+        if num_slices % num_channels as usize != 0 {
+            return Err(DecodeError::InvalidFrameHeader);
+        }
 
         if let ProcessingMode::FixedSamples {
             channels: decoded_channels,
             sample_rate: decoded_sample_rate,
             ..
-        } = self.mode
+        } = &mut self.mode
         {
-            if channels != decoded_channels || sample_rate != decoded_sample_rate {
+            if first {
+                *decoded_channels = num_channels;
+                *decoded_sample_rate = sample_rate;
+            } else if num_channels != *decoded_channels || sample_rate != *decoded_sample_rate {
                 // Error with invalid frame header, incompatible with the decoder metadata
                 return Err(DecodeError::IncompatibleFrame);
             }
         }
 
-        if frame_size > bytes.len() || total_samples * channels as usize > max_total_samples {
-            return Err(DecodeError::InvalidHeader);
-        }
-
-        let mut frame = Frame {
-            channels,
-            sample_rate,
-            samples: vec![0i16; total_samples * channels as usize],
-        };
-
-        // Initialize the LMS state if needed, when streaming the number of channels might change
-        if self.lms.len() != channels as usize && matches!(self.mode, ProcessingMode::Streaming) {
-            self.lms = vec![
-                QoaLms {
-                    history: [0; QOA_LMS_LEN],
-                    weights: [0; QOA_LMS_LEN],
-                };
-                channels as usize
-            ];
-        } else if self.lms.len() != channels as usize {
-            // Error with invalid number of channels in non-streaming mode
-            return Err(DecodeError::InvalidHeader);
+        // Initialize the LMS state if needed, when streaming the number of channels
+        // might change
+        if self.lms.len() != num_channels as usize {
+            // Already checked number of channels did not change in Fixed mode above.
+            assert!(matches!(self.mode, ProcessingMode::Streaming) || first);
+            self.lms
+                .resize_with(num_channels as usize, Default::default);
         }
 
         // Read the LMS state: 4 x 2 bytes history, 4 x 2 bytes weights per channel
-        let mut processed_bytes = 8;
-        for c in 0..channels as usize {
-            let mut history = u64::from_be_bytes(
-                bytes[processed_bytes..processed_bytes + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let mut weights = u64::from_be_bytes(
-                bytes[processed_bytes + 8..processed_bytes + 16]
-                    .try_into()
-                    .unwrap(),
-            );
-            processed_bytes += 16;
+        for c in 0..num_channels as usize {
+            let mut history = read_u64_be(&mut self.reader)?;
+            let mut weights = read_u64_be(&mut self.reader)?;
 
             for i in 0..QOA_LMS_LEN {
                 self.lms[c].history[i] = ((history >> 48) as i16) as i32;
@@ -209,61 +205,136 @@ impl QoaDecoder {
             }
         }
 
-        let decoded_bytes = self.decode_slices(bytes, processed_bytes, &mut frame);
-        Ok((frame, decoded_bytes + processed_bytes))
+        self.current_frame = CurrentFrame {
+            header: frame_header,
+            num_samples_per_channel_remaining: num_samples_per_channel,
+        };
+
+        Ok(true)
     }
 
-    fn decode_slices(&mut self, bytes: &[u8], start: usize, frame: &mut Frame) -> usize {
-        // The bytes is the full frame, so we need to skip the header which the start parameter
-        // indicated the start of the slices part of the data.
-        let mut processed_bytes = start;
-        let mut sample_index = 0;
-
-        let channels = frame.channels as usize;
-        let data = &mut frame.samples;
-        let total_samples = data.len() / channels;
-
-        while sample_index < total_samples && processed_bytes + 8 < bytes.len() {
-            for c in 0..channels {
-                let mut slice = u64::from_be_bytes(
-                    bytes[processed_bytes..processed_bytes + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-
-                let scale_factor = ((slice >> 60) & 0xf) as i32;
-                let slice_end = (sample_index + QOA_SLICE_LEN).min(total_samples) * channels + c;
-
-                let slice_start = sample_index * channels + c;
-                for si in (slice_start..slice_end).step_by(channels) {
-                    let prediction = self.lms[c].predict();
-                    let quantized = ((slice >> 57) & 0x7) as usize;
-                    let dequantized = QOA_DEQUANT_TAB[scale_factor as usize][quantized];
-                    let reconstructed = (prediction + dequantized).clamp(-32768, 32767) as i16;
-
-                    data[si] = reconstructed;
-                    slice <<= 3;
-
-                    self.lms[c].update(reconstructed, dequantized);
-                }
-
-                processed_bytes += 8;
-            }
-
-            sample_index += QOA_SLICE_LEN;
+    fn decode_one_slice_per_channel(&mut self) -> Result<(), DecodeError> {
+        assert!(self.next_pending_sample_idx >= self.pending_samples.len());
+        let channels = self.current_frame.header.num_channels as usize;
+        let num_samples_per_channel = u16::min(
+            self.current_frame.num_samples_per_channel_remaining,
+            QOA_SLICE_LEN as u16,
+        );
+        let total_num_samples = num_samples_per_channel as usize * channels;
+        if self.pending_samples.len() != total_num_samples {
+            self.pending_samples = vec![0_i16; total_num_samples].into_boxed_slice();
         }
+        self.next_pending_sample_idx = 0;
 
-        // Returns the number of samples processed and the total amount of bytes processed
-        // since we started at the start index, we subtract it to get the total.
-        processed_bytes - start
+        for channel_idx in 0..channels {
+            let mut slice = read_u64_be(&mut self.reader)?;
+
+            let scale_factor = ((slice >> 60) & 0xf) as i32;
+            for sample_in_channel_slice_idx in 0..num_samples_per_channel {
+                let prediction = self.lms[channel_idx].predict();
+                let quantized = ((slice >> 57) & 0x7) as usize;
+                let dequantized = QOA_DEQUANT_TAB[scale_factor as usize][quantized];
+                let reconstructed = (prediction + dequantized).clamp(-32768, 32767) as i16;
+
+                let data_idx = sample_in_channel_slice_idx as usize * channels + channel_idx;
+
+                self.pending_samples[data_idx] = reconstructed;
+                slice <<= 3;
+
+                self.lms[channel_idx].update(reconstructed, dequantized);
+            }
+        }
+        self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel;
+        Ok(())
     }
+}
+
+impl QoaDecoder<std::io::BufReader<std::fs::File>> {
+    /// Open a file, wrap it with BufReader and create a new decoder.
+    pub fn open<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<QoaDecoder<std::io::BufReader<std::fs::File>>, DecodeError> {
+        let file = std::fs::File::open(path)?;
+        QoaDecoder::new(std::io::BufReader::new(file))
+    }
+}
+
+/// Return type of [`QoaDecoder::next`].
+pub enum QoaItem {
+    Sample(i16),
+    FrameHeader(FrameHeader),
+}
+
+impl<R: Read> Iterator for QoaDecoder<R> {
+    type Item = Result<QoaItem, DecodeError>;
+
+    /// Get the next sample or the frame header if a new frame is starting.
+    ///
+    /// If an error is returned, iteration should be considered finished and
+    /// next should not be called again.
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(sample) = self.pending_samples.get(self.next_pending_sample_idx) {
+            self.next_pending_sample_idx += 1;
+            return Some(Ok(QoaItem::Sample(*sample)));
+        }
+        if !self.returned_first_frame_header {
+            // For consistency return the header read in the `new` function.
+            self.returned_first_frame_header = true;
+            return Some(Ok(QoaItem::FrameHeader(self.current_frame.header)));
+        }
+        if self.current_frame.num_samples_per_channel_remaining > 0 {
+            if let Err(e) = self.decode_one_slice_per_channel() {
+                return Some(Err(e));
+            }
+        } else {
+            match self.decode_frame_header_and_lms(false) {
+                Ok(true) => return Some(Ok(QoaItem::FrameHeader(self.current_frame.header))),
+                Ok(false) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        debug_assert!(!self.pending_samples.is_empty());
+        self.next()
+    }
+}
+
+#[derive(Debug, Default)]
+struct CurrentFrame {
+    header: FrameHeader,
+    /// Number of samples to be read per channel before this frame is done
+    num_samples_per_channel_remaining: u16,
+}
+
+/// The metadata at the beginning of each frame of slices.
+#[derive(Debug, Copy, Clone, Default)]
+pub struct FrameHeader {
+    /// Number of channels in this frame
+    pub num_channels: u8,
+    /// Sample rate in HZ for this frame
+    pub sample_rate: u32,
+    /// Samples per channel in this frame
+    pub num_samples_per_channel: u16,
+}
+
+fn read_u32_be<R: Read>(mut reader: R) -> std::io::Result<u32> {
+    Ok(u32::from_be_bytes(read_array(&mut reader)?))
+}
+
+fn read_u64_be<R: Read>(mut reader: R) -> std::io::Result<u64> {
+    Ok(u64::from_be_bytes(read_array(&mut reader)?))
+}
+
+fn read_array<R: Read, const LEN: usize>(mut reader: R) -> std::io::Result<[u8; LEN]> {
+    let mut bytes = [0_u8; LEN];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 impl QoaLms {
     fn predict(&self) -> i32 {
-        let mut prediction = 0;
+        let mut prediction: i32 = 0;
         for i in 0..QOA_LMS_LEN {
-            prediction += self.weights[i] * self.history[i];
+            prediction = prediction.wrapping_add(self.weights[i] * self.history[i]);
         }
         prediction >> 13
     }
@@ -300,41 +371,13 @@ const QOA_DEQUANT_TAB: [[i32; 8]; 16] = [
     [1536, -1536, 5120, -5120, 9216, -9216, 14336, -14336],
 ];
 
-#[derive(Debug, Clone)]
-pub struct Frame {
-    samples: Vec<i16>,
-    channels: u32,
-    sample_rate: u32,
-}
-
-impl Frame {
-    pub fn channels(&self) -> u32 {
-        self.channels
-    }
-
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    pub fn samples(&self) -> &[i16] {
-        &self.samples
-    }
-
-    pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(
-            self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64,
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum DecodeError {
-    LessThanMinimumFileSize,
     NotQoaFile,
     NoSamples,
-    InvalidHeader,
-    NotEnoughBytes,
+    InvalidFrameHeader,
     IncompatibleFrame,
+    IoError(std::io::Error),
 }
 
 impl std::error::Error for DecodeError {}
@@ -342,99 +385,94 @@ impl std::error::Error for DecodeError {}
 impl Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            DecodeError::LessThanMinimumFileSize => {
-                write!(f, "File is less than minimum size of 16 bytes")
-            }
             DecodeError::NotQoaFile => write!(f, "File is not a qoa file"),
             DecodeError::NoSamples => write!(f, "File has no samples"),
-            DecodeError::InvalidHeader => write!(f, "File has invalid header"),
-            DecodeError::NotEnoughBytes => write!(f, "Not enough bytes to decode"),
+            DecodeError::InvalidFrameHeader => write!(f, "File has invalid frame header"),
             DecodeError::IncompatibleFrame => write!(f, "Incompatible frame header"),
+            DecodeError::IoError(e) => write!(f, "IO error: {}", e),
         }
     }
 }
 
-pub struct DecodedAudio {
-    channels: u32,
-    sample_rate: u32,
-    samples: VecDeque<i16>,
-}
-
-impl Iterator for DecodedAudio {
-    type Item = i16;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.samples.pop_front()
+impl From<std::io::Error> for DecodeError {
+    fn from(inner: std::io::Error) -> Self {
+        DecodeError::IoError(inner)
     }
 }
 
-impl TryFrom<Vec<Frame>> for DecodedAudio {
-    type Error = DecodeError;
-
-    fn try_from(frames: Vec<Frame>) -> Result<Self, Self::Error> {
-        if frames.is_empty() {
-            return Err(DecodeError::NoSamples);
-        }
-
-        let channels = frames[0].channels();
-        let sample_rate = frames[0].sample_rate();
-
-        let mut samples = Vec::new();
-        for frame in frames {
-            if frame.channels() != channels {
-                return Err(DecodeError::InvalidHeader);
-            }
-
-            if frame.sample_rate() != sample_rate {
-                return Err(DecodeError::InvalidHeader);
-            }
-
-            samples.extend_from_slice(frame.samples());
-        }
-
-        Ok(DecodedAudio {
-            channels,
-            sample_rate,
-            samples: samples.into(),
-        })
-    }
-}
-
-impl DecodedAudio {
-    pub fn channels(&self) -> u32 {
-        self.channels
-    }
-
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(
-            self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64,
-        )
-    }
+#[cfg(feature = "rodio")]
+pub struct QoaRodioSource<R: Read> {
+    decoder: QoaDecoder<R>,
 }
 
 #[cfg(feature = "rodio")]
 mod rodio_integration {
     use super::*;
 
-    impl rodio::Source for DecodedAudio {
+    impl<R: Read> QoaRodioSource<R> {
+        /// Wrap a decoder as a Rodio Source for playback.
+        pub fn new(decoder: QoaDecoder<R>) -> QoaRodioSource<R> {
+            Self { decoder }
+        }
+    }
+
+    impl<R: Read> Iterator for QoaRodioSource<R> {
+        type Item = i16;
+
+        /// Return samples of i16 for Rodio.
+        ///
+        /// Errors stop iteration. Also ensure that `channels` and `sample_rate`
+        /// reflect the next sample to be returned.
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                return match self.decoder.next() {
+                    Some(Ok(QoaItem::Sample(s))) => {
+                        if self.decoder.next_pending_sample_idx
+                            >= self.decoder.pending_samples.len()
+                            && self.decoder.current_frame.num_samples_per_channel_remaining == 0
+                        {
+                            // This frame is done. We need to process the next frame header now so
+                            // the current channels and sample rate will
+                            // be returned correctly to Rodio.
+                            match self.decoder.next() {
+                                Some(Ok(QoaItem::FrameHeader(_))) => (),
+                                Some(Ok(QoaItem::Sample(_))) => unreachable!(),
+                                Some(Err(_)) => return None,
+                                None => (), // We will return None again on the next call.
+                            }
+                        }
+                        Some(s)
+                    }
+                    Some(Ok(QoaItem::FrameHeader(_))) => continue,
+                    Some(Err(_)) => None,
+                    None => None,
+                };
+            }
+        }
+    }
+
+    impl<R: Read> rodio::Source for QoaRodioSource<R> {
         fn current_frame_len(&self) -> Option<usize> {
-            None
+            if matches!(self.decoder.mode, ProcessingMode::Streaming) {
+                let num_samples = self.decoder.current_frame.num_samples_per_channel_remaining
+                    as usize
+                    * self.decoder.current_frame.header.num_channels as usize;
+                Some(num_samples)
+            } else {
+                None
+            }
         }
 
         fn channels(&self) -> u16 {
-            self.channels() as u16
+            self.decoder.current_frame.header.num_channels.into()
         }
 
         fn sample_rate(&self) -> u32 {
-            self.sample_rate()
+            self.decoder.current_frame.header.sample_rate
         }
 
         fn total_duration(&self) -> Option<Duration> {
-            Some(self.duration())
+            self.decoder.total_duration()
         }
     }
 }
@@ -442,14 +480,15 @@ mod rodio_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    static QOA_BYTES: &[u8] = include_bytes!("../fixtures/julien_baker_sprained_ankle.qoa");
 
     #[test]
-    fn it_works() {
-        let qoa_bytes = include_bytes!("../fixtures/julien_baker_sprained_ankle.qoa");
-
-        let mut qoa = QoaDecoder::decode_header(qoa_bytes).unwrap();
+    fn test_iterating_through_whole_file() {
+        let qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
         assert!(matches!(
-            qoa.mode,
+            qoa.mode(),
             ProcessingMode::FixedSamples {
                 channels: 2,
                 sample_rate: 44100,
@@ -458,14 +497,21 @@ mod tests {
             }
         ));
 
-        let audio = qoa.decode_frames(qoa_bytes).unwrap();
-        assert!(!audio.is_empty());
-        assert_eq!(audio[0].channels(), 2);
-        assert_eq!(audio[0].sample_rate(), 44100);
+        let mut frame_headers_seen = 0;
+        let mut samples_seen = 0;
 
-        let audio = DecodedAudio::try_from(audio).unwrap();
-        assert_eq!(audio.channels(), 2);
-        assert_eq!(audio.sample_rate(), 44100);
-        assert_eq!(audio.duration(), Duration::from_secs_f64(54.288480726));
+        for item in qoa {
+            let item = item.expect("No io errors should happen");
+            match item {
+                QoaItem::Sample(_) => samples_seen += 1,
+                QoaItem::FrameHeader(header) => {
+                    assert_eq!(header.num_channels, 2);
+                    assert_eq!(header.sample_rate, 44100);
+                    frame_headers_seen += 1
+                }
+            }
+        }
+        assert_eq!(frame_headers_seen, 468);
+        assert_eq!(samples_seen, 2394122 * 2);
     }
 }
