@@ -298,6 +298,60 @@ impl<R: Read> Iterator for QoaDecoder<R> {
     }
 }
 
+/// A fully decoded QOA file.
+pub struct DecodedQoa {
+    /// Number of channels in `samples`
+    pub num_channels: u8,
+    /// Sample rate in HZ of `samples`
+    pub sample_rate: u32,
+    /// Interleaved samples of all channels (e.g. L-R-L-R-L-R... if there are two channels)
+    pub samples: Vec<i16>,
+}
+
+/// Decode all samples of a QOA file read from `reader`.
+///
+/// If not all frames in the file have the same number of channels and the same
+/// sample rate DecodeError::IncompatibleFrame is returned.
+/// This is a convenience function that uses QoaDecoder internally. QoaDecoder
+/// is able to decode samples even if frames have different number of channels
+/// or sample rate.
+pub fn decode_all<R: Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
+    let mut decoder = QoaDecoder::new(reader)?;
+    let mut samples = Vec::new();
+    if let ProcessingMode::FixedSamples {
+        samples: total_num_samples,
+        ..
+    } = decoder.mode()
+    {
+        samples.reserve_exact(*total_num_samples as usize);
+    }
+    let QoaItem::FrameHeader(FrameHeader { num_channels, sample_rate, .. }) = decoder.next().unwrap()? else {
+        unreachable!();
+    };
+    for item in decoder {
+        match item? {
+            QoaItem::Sample(s) => samples.push(s),
+            QoaItem::FrameHeader(header) => {
+                if num_channels != header.num_channels || sample_rate != header.sample_rate {
+                    return Err(DecodeError::IncompatibleFrame);
+                }
+            }
+        }
+    }
+    Ok(DecodedQoa {
+        num_channels,
+        sample_rate,
+        samples,
+    })
+}
+
+/// Same as [`decode_all`] but open the file and wrap in a BufReader first.
+pub fn open_and_decode_all<P: AsRef<std::path::Path>>(path: P) -> Result<DecodedQoa, DecodeError> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let reader = std::io::BufReader::new(file);
+    decode_all(reader)
+}
+
 #[derive(Debug, Default)]
 struct CurrentFrame {
     header: FrameHeader,
@@ -507,11 +561,24 @@ mod tests {
                 QoaItem::FrameHeader(header) => {
                     assert_eq!(header.num_channels, 2);
                     assert_eq!(header.sample_rate, 44100);
-                    frame_headers_seen += 1
+                    frame_headers_seen += 1;
+                    if frame_headers_seen < 468 {
+                        assert_eq!(header.num_samples_per_channel, 5120);
+                    } else {
+                        assert_eq!(header.num_samples_per_channel, 3082);
+                    }
                 }
             }
         }
         assert_eq!(frame_headers_seen, 468);
         assert_eq!(samples_seen, 2394122 * 2);
+    }
+
+    #[test]
+    fn test_decode_all() {
+        let decoded = decode_all(Cursor::new(QOA_BYTES)).unwrap();
+        assert_eq!(decoded.sample_rate, 44100);
+        assert_eq!(decoded.num_channels, 2);
+        assert_eq!(decoded.samples.len(), 2394122 * 2);
     }
 }
