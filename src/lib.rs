@@ -260,6 +260,7 @@ impl QoaDecoder<std::io::BufReader<std::fs::File>> {
 }
 
 /// Return type of [`QoaDecoder::next`].
+#[derive(Debug)]
 pub enum QoaItem {
     Sample(i16),
     FrameHeader(FrameHeader),
