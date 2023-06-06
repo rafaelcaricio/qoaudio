@@ -1,0 +1,27 @@
+[package]
+name = "qoaudio-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.qoaudio]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "iter_all"
+path = "fuzz_targets/iter_all.rs"
+test = false
+doc = false
