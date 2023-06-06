@@ -10,6 +10,7 @@ pub const QOA_SLICE_LEN: usize = 20;
 pub const QOA_LMS_LEN: usize = 4;
 pub const QOA_HEADER_SIZE: usize = 8;
 pub const QOA_MAGIC: u32 = u32::from_be_bytes(*b"qoaf");
+const MAX_SLICES_PER_CHANNEL_PER_FRAME: usize = 256;
 
 /// The decoding mode of the QOA file.
 #[derive(Debug, Clone)]
@@ -159,12 +160,22 @@ where
             num_samples_per_channel,
         };
 
+        if num_channels == 0 || sample_rate == 0 {
+            return Err(DecodeError::InvalidFrameHeader);
+        }
+
         const LMS_SIZE: usize = 4;
-        let data_size =
-            frame_size as usize - QOA_HEADER_SIZE - QOA_LMS_LEN * LMS_SIZE * num_channels as usize;
+        let non_sample_data_size = QOA_HEADER_SIZE + QOA_LMS_LEN * LMS_SIZE * num_channels as usize;
+        if frame_size as usize <= non_sample_data_size {
+            return Err(DecodeError::InvalidFrameHeader);
+        }
+        let data_size = frame_size as usize - non_sample_data_size;
         let num_slices = data_size / 8;
 
         if num_slices % num_channels as usize != 0 {
+            return Err(DecodeError::InvalidFrameHeader);
+        }
+        if num_slices / num_channels as usize > MAX_SLICES_PER_CHANNEL_PER_FRAME {
             return Err(DecodeError::InvalidFrameHeader);
         }
 
@@ -305,7 +316,8 @@ pub struct DecodedQoa {
     pub num_channels: u8,
     /// Sample rate in HZ of `samples`
     pub sample_rate: u32,
-    /// Interleaved samples of all channels (e.g. L-R-L-R-L-R... if there are two channels)
+    /// Interleaved samples of all channels (e.g. L-R-L-R-L-R... if there are
+    /// two channels)
     pub samples: Vec<i16>,
 }
 
@@ -389,7 +401,12 @@ impl QoaLms {
     fn predict(&self) -> i32 {
         let mut prediction: i32 = 0;
         for i in 0..QOA_LMS_LEN {
-            prediction = prediction.wrapping_add(self.weights[i] * self.history[i]);
+            // The spec does not specify a precision for these operations or
+            // how to handle overflow. The reference C implementation does
+            // not prevent signed integer overflow (undefined behavior). Since
+            // overflow should not occur in a properly encoded file, we take the
+            // lower overhead option of just allowing wrapping.
+            prediction = prediction.wrapping_add(self.weights[i].wrapping_mul(self.history[i]));
         }
         prediction >> 13
     }
