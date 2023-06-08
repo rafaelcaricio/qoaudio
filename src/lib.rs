@@ -227,27 +227,23 @@ where
     fn decode_one_slice_per_channel(&mut self) -> Result<(), DecodeError> {
         assert!(self.next_pending_sample_idx >= self.pending_samples.len());
         let channels = self.current_frame.header.num_channels as usize;
-        let num_samples_per_channel = u16::min(
-            self.current_frame.num_samples_per_channel_remaining,
-            QOA_SLICE_LEN as u16,
-        );
-        let total_num_samples = num_samples_per_channel as usize * channels;
-        if self.pending_samples.len() != total_num_samples {
-            self.pending_samples = vec![0_i16; total_num_samples].into_boxed_slice();
+        let full_slices_num_samples = QOA_SLICE_LEN * channels;
+        if self.pending_samples.len() != full_slices_num_samples {
+            self.pending_samples = vec![0_i16; full_slices_num_samples].into_boxed_slice();
         }
         self.next_pending_sample_idx = 0;
 
         for channel_idx in 0..channels {
             let mut slice = read_u64_be(&mut self.reader)?;
 
-            let scale_factor = ((slice >> 60) & 0xf) as i32;
-            for sample_in_channel_slice_idx in 0..num_samples_per_channel {
+            let scale_factor = ((slice >> 60) & 0xf) as usize;
+            for sample_in_channel_slice_idx in 0..QOA_SLICE_LEN {
                 let prediction = self.lms[channel_idx].predict();
                 let quantized = ((slice >> 57) & 0x7) as usize;
-                let dequantized = QOA_DEQUANT_TAB[scale_factor as usize][quantized];
+                let dequantized = QOA_DEQUANT_TAB[scale_factor][quantized];
                 let reconstructed = (prediction + dequantized).clamp(-32768, 32767) as i16;
 
-                let data_idx = sample_in_channel_slice_idx as usize * channels + channel_idx;
+                let data_idx = sample_in_channel_slice_idx * channels + channel_idx;
 
                 self.pending_samples[data_idx] = reconstructed;
                 slice <<= 3;
@@ -255,7 +251,20 @@ where
                 self.lms[channel_idx].update(reconstructed, dequantized);
             }
         }
-        self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel;
+        let num_samples_per_channel = self.current_frame.num_samples_per_channel_remaining;
+        if (num_samples_per_channel as usize) < QOA_SLICE_LEN {
+            let total_num_samples = num_samples_per_channel as usize * channels;
+            // If this is the last slice of the file, it might not have all 20
+            // samples and be zero filled. Cut off the excess 0 samples. This
+            // is done after the loop so the loop can have a constant size for
+            // better compiler optimizations.
+            self.pending_samples = self.pending_samples[0..total_num_samples]
+                .to_vec()
+                .into_boxed_slice();
+            self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel as u16;
+        } else {
+            self.current_frame.num_samples_per_channel_remaining -= QOA_SLICE_LEN as u16;
+        }
         Ok(())
     }
 }
@@ -398,6 +407,7 @@ fn read_array<R: Read, const LEN: usize>(mut reader: R) -> std::io::Result<[u8; 
 }
 
 impl QoaLms {
+    #[inline(always)]
     fn predict(&self) -> i32 {
         let mut prediction: i32 = 0;
         for i in 0..QOA_LMS_LEN {
@@ -411,6 +421,7 @@ impl QoaLms {
         prediction >> 13
     }
 
+    #[inline(always)]
     fn update(&mut self, sample: i16, residual: i32) {
         let delta = residual >> 4;
         for i in 0..QOA_LMS_LEN {
