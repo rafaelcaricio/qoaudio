@@ -18,8 +18,11 @@ pub enum ProcessingMode {
     /// Total number of samples is known and sample rate and number of channels
     /// is fixed for the entire file.
     FixedSamples {
+        /// Number of channels.
         channels: u8,
+        /// The sample rate for all channels in HZ (e.g. 44100)
         sample_rate: u32,
+        /// Number of samples per channel in the entire file.
         samples: u32,
     },
     /// Total number of samples is not known and the sample rate and number of
@@ -340,12 +343,13 @@ pub struct DecodedQoa {
 pub fn decode_all<R: Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
     let mut decoder = QoaDecoder::new(reader)?;
     let mut samples = Vec::new();
-    if let ProcessingMode::FixedSamples {
-        samples: total_num_samples,
+    if let &ProcessingMode::FixedSamples {
+        samples: samples_per_channel,
+        channels,
         ..
     } = decoder.mode()
     {
-        samples.reserve_exact(*total_num_samples as usize);
+        samples.reserve_exact(samples_per_channel as usize * channels as usize);
     }
     let QoaItem::FrameHeader(FrameHeader { num_channels, sample_rate, .. }) = decoder.next().unwrap()? else {
         unreachable!();
