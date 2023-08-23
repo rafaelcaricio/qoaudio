@@ -16,7 +16,7 @@ criterion = "0.3"
 
 [features]
 default = []
-rodio = ["dep:rodio"]
+rodio = ["rodio"]
 
 [[example]]
 name = "play"
