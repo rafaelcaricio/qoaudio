@@ -3,8 +3,10 @@
 //!
 //! A library for decoding qoa files.
 use std::fmt::Display;
-use std::io::Read;
+use std::fs::File;
+use std::path::Path;
 use std::time::Duration;
+use std::{fmt, io};
 
 pub const QOA_SLICE_LEN: usize = 20;
 pub const QOA_LMS_LEN: usize = 4;
@@ -60,13 +62,13 @@ struct QoaLms {
 
 impl<R> QoaDecoder<R>
 where
-    R: Read,
+    R: io::Read,
 {
     /// Read the file header and first frame header of a QOA file read from
     /// `reader`.
     ///
     /// QoaDecoder makes many small reads so wrapping a `File` with a
-    /// `BufReader` is recommend. This is done automatically when using
+    /// `BufReader` is recommended. This is done automatically when using
     /// [`QoaDecoder::open`].
     pub fn new(mut reader: R) -> Result<Self, DecodeError> {
         let magic = read_u32_be(&mut reader)?;
@@ -145,12 +147,12 @@ where
         let frame_header = match frame_header {
             Ok(h) => h,
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return if e.kind() == io::ErrorKind::UnexpectedEof {
                     // This is expected.
-                    return Ok(false);
+                    Ok(false)
                 } else {
-                    return Err(e.into());
-                }
+                    Err(e.into())
+                };
             }
         };
         let num_channels = ((frame_header >> 56) & 0x0000ff) as u8;
@@ -264,7 +266,7 @@ where
             self.pending_samples = self.pending_samples[0..total_num_samples]
                 .to_vec()
                 .into_boxed_slice();
-            self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel as u16;
+            self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel;
         } else {
             self.current_frame.num_samples_per_channel_remaining -= QOA_SLICE_LEN as u16;
         }
@@ -272,13 +274,11 @@ where
     }
 }
 
-impl QoaDecoder<std::io::BufReader<std::fs::File>> {
+impl QoaDecoder<io::BufReader<File>> {
     /// Open a file, wrap it with BufReader and create a new decoder.
-    pub fn open<P: AsRef<std::path::Path>>(
-        path: P,
-    ) -> Result<QoaDecoder<std::io::BufReader<std::fs::File>>, DecodeError> {
-        let file = std::fs::File::open(path)?;
-        QoaDecoder::new(std::io::BufReader::new(file))
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<QoaDecoder<io::BufReader<File>>, DecodeError> {
+        let file = File::open(path)?;
+        QoaDecoder::new(io::BufReader::new(file))
     }
 }
 
@@ -289,7 +289,7 @@ pub enum QoaItem {
     FrameHeader(FrameHeader),
 }
 
-impl<R: Read> Iterator for QoaDecoder<R> {
+impl<R: io::Read> Iterator for QoaDecoder<R> {
     type Item = Result<QoaItem, DecodeError>;
 
     /// Get the next sample or the frame header if a new frame is starting.
@@ -311,11 +311,11 @@ impl<R: Read> Iterator for QoaDecoder<R> {
                 return Some(Err(e));
             }
         } else {
-            match self.decode_frame_header_and_lms(false) {
-                Ok(true) => return Some(Ok(QoaItem::FrameHeader(self.current_frame.header))),
-                Ok(false) => return None,
-                Err(e) => return Some(Err(e)),
-            }
+            return match self.decode_frame_header_and_lms(false) {
+                Ok(true) => Some(Ok(QoaItem::FrameHeader(self.current_frame.header))),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            };
         }
         debug_assert!(!self.pending_samples.is_empty());
         self.next()
@@ -340,7 +340,7 @@ pub struct DecodedQoa {
 /// This is a convenience function that uses QoaDecoder internally. QoaDecoder
 /// is able to decode samples even if frames have different number of channels
 /// or sample rate.
-pub fn decode_all<R: Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
+pub fn decode_all<R: io::Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
     let mut decoder = QoaDecoder::new(reader)?;
     let mut samples = Vec::new();
     if let &ProcessingMode::FixedSamples {
@@ -351,7 +351,12 @@ pub fn decode_all<R: Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
     {
         samples.reserve_exact(samples_per_channel as usize * channels as usize);
     }
-    let QoaItem::FrameHeader(FrameHeader { num_channels, sample_rate, .. }) = decoder.next().unwrap()? else {
+    let QoaItem::FrameHeader(FrameHeader {
+        num_channels,
+        sample_rate,
+        ..
+    }) = decoder.next().unwrap()?
+    else {
         unreachable!();
     };
     for item in decoder {
@@ -372,9 +377,9 @@ pub fn decode_all<R: Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
 }
 
 /// Same as [`decode_all`] but open the file and wrap in a BufReader first.
-pub fn open_and_decode_all<P: AsRef<std::path::Path>>(path: P) -> Result<DecodedQoa, DecodeError> {
-    let file = std::fs::File::open(path.as_ref())?;
-    let reader = std::io::BufReader::new(file);
+pub fn open_and_decode_all<P: AsRef<Path>>(path: P) -> Result<DecodedQoa, DecodeError> {
+    let file = File::open(path.as_ref())?;
+    let reader = io::BufReader::new(file);
     decode_all(reader)
 }
 
@@ -396,15 +401,15 @@ pub struct FrameHeader {
     pub num_samples_per_channel: u16,
 }
 
-fn read_u32_be<R: Read>(mut reader: R) -> std::io::Result<u32> {
+fn read_u32_be<R: io::Read>(mut reader: R) -> io::Result<u32> {
     Ok(u32::from_be_bytes(read_array(&mut reader)?))
 }
 
-fn read_u64_be<R: Read>(mut reader: R) -> std::io::Result<u64> {
+fn read_u64_be<R: io::Read>(mut reader: R) -> io::Result<u64> {
     Ok(u64::from_be_bytes(read_array(&mut reader)?))
 }
 
-fn read_array<R: Read, const LEN: usize>(mut reader: R) -> std::io::Result<[u8; LEN]> {
+fn read_array<R: io::Read, const LEN: usize>(mut reader: R) -> io::Result<[u8; LEN]> {
     let mut bytes = [0_u8; LEN];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
@@ -464,13 +469,13 @@ pub enum DecodeError {
     NoSamples,
     InvalidFrameHeader,
     IncompatibleFrame,
-    IoError(std::io::Error),
+    IoError(io::Error),
 }
 
 impl std::error::Error for DecodeError {}
 
 impl Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             DecodeError::NotQoaFile => write!(f, "File is not a qoa file"),
             DecodeError::NoSamples => write!(f, "File has no samples"),
@@ -481,14 +486,14 @@ impl Display for DecodeError {
     }
 }
 
-impl From<std::io::Error> for DecodeError {
-    fn from(inner: std::io::Error) -> Self {
+impl From<io::Error> for DecodeError {
+    fn from(inner: io::Error) -> Self {
         DecodeError::IoError(inner)
     }
 }
 
 #[cfg(feature = "rodio")]
-pub struct QoaRodioSource<R: Read> {
+pub struct QoaRodioSource<R: io::Read> {
     decoder: QoaDecoder<R>,
 }
 
@@ -496,14 +501,14 @@ pub struct QoaRodioSource<R: Read> {
 mod rodio_integration {
     use super::*;
 
-    impl<R: Read> QoaRodioSource<R> {
+    impl<R: io::Read> QoaRodioSource<R> {
         /// Wrap a decoder as a Rodio Source for playback.
         pub fn new(decoder: QoaDecoder<R>) -> QoaRodioSource<R> {
             Self { decoder }
         }
     }
 
-    impl<R: Read> Iterator for QoaRodioSource<R> {
+    impl<R: io::Read> Iterator for QoaRodioSource<R> {
         type Item = i16;
 
         /// Return samples of i16 for Rodio.
@@ -538,7 +543,7 @@ mod rodio_integration {
         }
     }
 
-    impl<R: Read> rodio::Source for QoaRodioSource<R> {
+    impl<R: io::Read> rodio::Source for QoaRodioSource<R> {
         fn current_frame_len(&self) -> Option<usize> {
             if matches!(self.decoder.mode, ProcessingMode::Streaming) {
                 let num_samples = self.decoder.current_frame.num_samples_per_channel_remaining
