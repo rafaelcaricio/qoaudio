@@ -4,6 +4,7 @@
 //! A library for decoding qoa files.
 use std::fmt::Display;
 use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 use std::{fmt, io};
@@ -12,10 +13,10 @@ pub const QOA_SLICE_LEN: usize = 20;
 pub const QOA_LMS_LEN: usize = 4;
 pub const QOA_HEADER_SIZE: usize = 8;
 pub const QOA_MAGIC: u32 = u32::from_be_bytes(*b"qoaf");
-const MAX_SLICES_PER_CHANNEL_PER_FRAME: usize = 256;
+pub const MAX_SLICES_PER_CHANNEL_PER_FRAME: usize = 256;
 
 /// The decoding mode of the QOA file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProcessingMode {
     /// Total number of samples is known and sample rate and number of channels
     /// is fixed for the entire file.
@@ -101,10 +102,15 @@ where
             next_pending_sample_idx: 0,
             returned_first_frame_header: false,
         };
-        let found_frame = to_return.decode_frame_header_and_lms(true)?;
-        if !found_frame {
-            return Err(DecodeError::NoSamples);
+
+        // If we are in streaming mode, then there is no frame header to read.
+        if to_return.mode != ProcessingMode::Streaming {
+            let found_frame = to_return.decode_frame_header_and_lms(true)?;
+            if !found_frame {
+                return Err(DecodeError::NoSamples);
+            }
         }
+
         Ok(to_return)
     }
 
@@ -143,8 +149,7 @@ where
     /// Returns Ok(true) if a frame was read. Returns Ok(false) if EOF was
     /// encountered before any bytes were read.
     fn decode_frame_header_and_lms(&mut self, first: bool) -> Result<bool, DecodeError> {
-        let frame_header = read_u64_be(&mut self.reader);
-        let frame_header = match frame_header {
+        let frame_header = match read_u64_be(&mut self.reader) {
             Ok(h) => h,
             Err(e) => {
                 return if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -279,6 +284,33 @@ impl QoaDecoder<io::BufReader<File>> {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<QoaDecoder<io::BufReader<File>>, DecodeError> {
         let file = File::open(path)?;
         QoaDecoder::new(io::BufReader::new(file))
+    }
+}
+
+impl QoaDecoder<Cursor<Vec<u8>>> {
+    /// Create a new decoder for use in streaming mode.
+    ///
+    /// This allows for decoding a single frame at a time. This is useful for
+    /// decoding QOA content that is being streamed over the network.
+    pub fn new_streaming() -> Result<Self, DecodeError> {
+        let streaming_header: Vec<u8> = [QOA_MAGIC, 0]
+            .iter()
+            .flat_map(|&x| x.to_be_bytes())
+            .collect();
+        QoaDecoder::new(Cursor::new(streaming_header))
+    }
+
+    /// Decode a single frame in streaming mode.
+    pub fn decode_frame(&mut self, frame_data: &[u8]) -> Result<Vec<i16>, DecodeError> {
+        self.reader.get_mut().extend_from_slice(frame_data);
+        let mut to_return = Vec::new();
+        for item in self {
+            match item? {
+                QoaItem::Sample(s) => to_return.push(s),
+                QoaItem::FrameHeader(_) => (),
+            }
+        }
+        Ok(to_return)
     }
 }
 
@@ -610,6 +642,40 @@ mod tests {
         }
         assert_eq!(frame_headers_seen, 468);
         assert_eq!(samples_seen, 2394122 * 2);
+    }
+
+    #[test]
+    fn test_decode_streaming_frames() {
+        let mut qoa = QoaDecoder::new_streaming().unwrap();
+        assert!(matches!(qoa.mode(), ProcessingMode::Streaming));
+
+        // Read first frame from sample file.
+        // We skip the standard file header and read the frame size present in the header. We
+        // use the frame size to capture the entire frame.
+        let frame_header =
+            read_u64_be(Cursor::new(QOA_BYTES[QOA_HEADER_SIZE..16].to_vec())).unwrap();
+        let frame_size = (frame_header & 0x00ffff) as u16;
+        let first_frame_end = 8 + frame_size as usize;
+
+        let samples = qoa
+            .decode_frame(&QOA_BYTES[QOA_HEADER_SIZE..first_frame_end])
+            .unwrap();
+        // We know the first frame has 5120 samples per channel.
+        assert_eq!(samples.len(), 5120 * 2);
+
+        // Read second frame from sample file.
+        let frame_header = read_u64_be(Cursor::new(
+            QOA_BYTES[first_frame_end..first_frame_end + QOA_HEADER_SIZE].to_vec(),
+        ))
+        .unwrap();
+        let frame_size = (frame_header & 0x00ffff) as u16;
+        let second_frame_end = first_frame_end + frame_size as usize;
+
+        let samples = qoa
+            .decode_frame(&QOA_BYTES[first_frame_end..second_frame_end])
+            .unwrap();
+        // We know the first frame has 5120 samples per channel.
+        assert_eq!(samples.len(), 5120 * 2);
     }
 
     #[test]
