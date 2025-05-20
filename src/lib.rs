@@ -1056,7 +1056,11 @@ mod encoder_tests {
         assert_eq!((sf, q_idx, dequant_val), (0, 6, 7), "Residual 8");
 
         let (sf, q_idx, dequant_val) = find_best_scale_factor_quantized_and_dequantized(50);
-        assert_eq!((sf, q_idx, dequant_val), (1, 6, 49), "Residual 50, Expected SF 1");
+        assert_eq!(
+            (sf, q_idx, dequant_val),
+            (1, 6, 49),
+            "Residual 50, Expected SF 1"
+        );
     }
 
     #[test]
