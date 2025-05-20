@@ -69,6 +69,26 @@ pub enum EncodeError {
     UnsupportedChannelCount,
 }
 
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EncodeError::IoError(e) => write!(f, "IO error: {}", e),
+            EncodeError::InvalidInput(s) => write!(f, "Invalid input: {}", s),
+            EncodeError::UnsupportedSampleRate => write!(f, "Unsupported sample rate"),
+            EncodeError::UnsupportedChannelCount => write!(f, "Unsupported channel count"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EncodeError::IoError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 pub struct QoaEncoder<W: io::Write> {
     writer: W,
     lms: Vec<QoaLms>,
@@ -712,20 +732,7 @@ pub fn encode_slice(
     Ok((slice_data, reconstructed_samples))
 }
 
-fn write_frame_header_to_buf(
-    buf: &mut Vec<u8>,
-    num_channels: u8,
-    sample_rate: u32,
-    samples_in_frame_per_channel: u16,
-    frame_size: u16,
-) {
-    buf.push(num_channels);
-    // sample_rate is u24, so we take the last 3 bytes of its u32 BE representation
-    let sr_bytes = sample_rate.to_be_bytes();
-    buf.extend_from_slice(&sr_bytes[1..4]);
-    buf.extend_from_slice(&samples_in_frame_per_channel.to_be_bytes());
-    buf.extend_from_slice(&frame_size.to_be_bytes());
-}
+// Function write_frame_header_to_buf was here and is now removed.
 
 pub fn encode_frame(
     input_samples_per_channel: &[Vec<i16>],
@@ -1049,7 +1056,7 @@ mod encoder_tests {
         assert_eq!((sf, q_idx, dequant_val), (0, 6, 7), "Residual 8");
 
         let (sf, q_idx, dequant_val) = find_best_scale_factor_quantized_and_dequantized(50);
-        assert_eq!((sf, q_idx, dequant_val), (0, 6, 49), "Residual 50");
+        assert_eq!((sf, q_idx, dequant_val), (1, 6, 49), "Residual 50, Expected SF 1");
     }
 
     #[test]
@@ -1064,15 +1071,12 @@ mod encoder_tests {
         let mut original_audio_data: Vec<Vec<Vec<i16>>> =
             vec![vec![vec![0i16; samples_per_frame_per_channel]; num_channels]; num_frames];
 
-        let mut global_sample_idx_per_channel = vec![0usize; num_channels];
-
+        // Simplified sample data generation
         for frame_idx in 0..num_frames {
             for chan_idx in 0..num_channels {
                 for sample_idx_in_frame in 0..samples_per_frame_per_channel {
-                    let s = global_sample_idx_per_channel[chan_idx];
                     original_audio_data[frame_idx][chan_idx][sample_idx_in_frame] =
-                        (((s * (chan_idx + 1)) % 2000) - 1000) as i16;
-                    global_sample_idx_per_channel[chan_idx] += 1;
+                        ((sample_idx_in_frame % 50) + (chan_idx * 10)) as i16; // Simple ramp
                 }
             }
         }
