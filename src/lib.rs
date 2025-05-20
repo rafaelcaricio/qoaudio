@@ -85,7 +85,8 @@ impl<W: io::Write> QoaEncoder<W> {
         sample_rate: u32,
         total_samples_per_channel_in_file: u32,
     ) -> Result<Self, EncodeError> {
-        if num_channels == 0 { // num_channels as usize > u8::MAX is implicitly handled by u8 type
+        if num_channels == 0 {
+            // num_channels as usize > u8::MAX is implicitly handled by u8 type
             return Err(EncodeError::UnsupportedChannelCount);
         }
         if sample_rate == 0 || sample_rate > 0xFFFFFF {
@@ -107,14 +108,22 @@ impl<W: io::Write> QoaEncoder<W> {
         })
     }
 
-    pub fn write_frame(&mut self, samples_for_frame_per_channel: &[Vec<i16>]) -> Result<(), EncodeError> {
+    pub fn write_frame(
+        &mut self,
+        samples_for_frame_per_channel: &[Vec<i16>],
+    ) -> Result<(), EncodeError> {
         if samples_for_frame_per_channel.len() != self.num_channels as usize {
-            return Err(EncodeError::InvalidInput("Channel count mismatch for frame"));
+            return Err(EncodeError::InvalidInput(
+                "Channel count mismatch for frame",
+            ));
         }
 
         // encode_frame performs other necessary validations
-        let (frame_header_info, frame_bytes) =
-            encode_frame(samples_for_frame_per_channel, &mut self.lms, self.sample_rate)?;
+        let (frame_header_info, frame_bytes) = encode_frame(
+            samples_for_frame_per_channel,
+            &mut self.lms,
+            self.sample_rate,
+        )?;
 
         self.writer.write_all(&frame_bytes)?;
         self.total_samples_written_per_channel += frame_header_info.num_samples_per_channel as u32;
@@ -586,7 +595,10 @@ pub enum DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-pub fn find_closest_dequantized_value_in_row(residual: i32, scale_factor_row: &[i32; 8]) -> (usize, i32) {
+pub fn find_closest_dequantized_value_in_row(
+    residual: i32,
+    scale_factor_row: &[i32; 8],
+) -> (usize, i32) {
     let mut best_quantized_idx = 0;
     let mut actual_dequantized_value = scale_factor_row[0];
     let mut min_diff = (residual - actual_dequantized_value).abs();
@@ -600,7 +612,8 @@ pub fn find_closest_dequantized_value_in_row(residual: i32, scale_factor_row: &[
             best_quantized_idx = idx;
             actual_dequantized_value = current_val;
         } else if diff == min_diff {
-            if current_val < actual_dequantized_value { // Tie-breaking for same diff
+            if current_val < actual_dequantized_value {
+                // Tie-breaking for same diff
                 best_quantized_idx = idx;
                 actual_dequantized_value = current_val;
             }
@@ -610,7 +623,8 @@ pub fn find_closest_dequantized_value_in_row(residual: i32, scale_factor_row: &[
 }
 
 pub fn quantize_residual(residual: i32, scale_factor: usize) -> usize {
-    let (best_quantized_idx, _) = find_closest_dequantized_value_in_row(residual, &QOA_DEQUANT_TAB[scale_factor]);
+    let (best_quantized_idx, _) =
+        find_closest_dequantized_value_in_row(residual, &QOA_DEQUANT_TAB[scale_factor]);
     best_quantized_idx
 }
 
@@ -620,7 +634,8 @@ pub fn find_best_scale_factor_quantized_and_dequantized(residual: i32) -> (usize
         find_closest_dequantized_value_in_row(residual, &QOA_DEQUANT_TAB[0]);
     let mut overall_min_diff = (residual - overall_actual_dequantized_value).abs();
 
-    for sf in 1..16 { // Iterate scale_factors from 1 to 15
+    for sf in 1..16 {
+        // Iterate scale_factors from 1 to 15
         let (current_quantized_idx, current_actual_dequantized_value) =
             find_closest_dequantized_value_in_row(residual, &QOA_DEQUANT_TAB[sf]);
         let current_diff = (residual - current_actual_dequantized_value).abs();
@@ -635,12 +650,21 @@ pub fn find_best_scale_factor_quantized_and_dequantized(residual: i32) -> (usize
         // is implicitly handled by iterating sf from low to high and only updating
         // overall_best_sf if a *strictly* smaller diff is found.
     }
-    (overall_best_sf, overall_best_quantized_idx, overall_actual_dequantized_value)
+    (
+        overall_best_sf,
+        overall_best_quantized_idx,
+        overall_actual_dequantized_value,
+    )
 }
 
-pub fn encode_slice(input_samples: &[i16], lms: &mut QoaLms) -> Result<(u64, Vec<i16>), EncodeError> {
+pub fn encode_slice(
+    input_samples: &[i16],
+    lms: &mut QoaLms,
+) -> Result<(u64, Vec<i16>), EncodeError> {
     if input_samples.len() != QOA_SLICE_LEN {
-        return Err(EncodeError::InvalidInput("Slice must contain QOA_SLICE_LEN samples"));
+        return Err(EncodeError::InvalidInput(
+            "Slice must contain QOA_SLICE_LEN samples",
+        ));
     }
 
     // 1. Determine slice_scale_factor
@@ -650,12 +674,14 @@ pub fn encode_slice(input_samples: &[i16], lms: &mut QoaLms) -> Result<(u64, Vec
     for &sample_val_i16 in input_samples.iter().take(QOA_SLICE_LEN) {
         let predicted = temp_lms_for_sf_finding.predict();
         let residual = sample_val_i16 as i32 - predicted;
-        let (ideal_sf, _, dequantized_for_temp_lms) = find_best_scale_factor_quantized_and_dequantized(residual);
+        let (ideal_sf, _, dequantized_for_temp_lms) =
+            find_best_scale_factor_quantized_and_dequantized(residual);
         if ideal_sf > max_ideal_sf {
             max_ideal_sf = ideal_sf;
         }
         // Update temp_lms for next ideal_sf calculation. Reconstruct and update.
-        let reconstructed_for_temp_lms = (predicted + dequantized_for_temp_lms).clamp(-32768, 32767) as i16;
+        let reconstructed_for_temp_lms =
+            (predicted + dequantized_for_temp_lms).clamp(-32768, 32767) as i16;
         temp_lms_for_sf_finding.update(reconstructed_for_temp_lms, dequantized_for_temp_lms);
     }
     let slice_scale_factor = max_ideal_sf;
@@ -670,27 +696,33 @@ pub fn encode_slice(input_samples: &[i16], lms: &mut QoaLms) -> Result<(u64, Vec
         let current_input_sample = input_samples[i];
         let predicted_sample = lms.predict();
         let residual = current_input_sample as i32 - predicted_sample;
-        
+
         let quantized_value_3bit = quantize_residual(residual, slice_scale_factor);
         let dequantized_residual = QOA_DEQUANT_TAB[slice_scale_factor][quantized_value_3bit];
-        
+
         let reconstructed_sample_i32 = predicted_sample + dequantized_residual;
         let reconstructed_sample_i16 = reconstructed_sample_i32.clamp(-32768, 32767) as i16;
-        
+
         reconstructed_samples.push(reconstructed_sample_i16);
         lms.update(reconstructed_sample_i16, dequantized_residual);
-        
+
         slice_data |= (quantized_value_3bit as u64) << (57 - (i * 3));
     }
 
     Ok((slice_data, reconstructed_samples))
 }
 
-fn write_frame_header_to_buf(buf: &mut Vec<u8>, num_channels: u8, sample_rate: u32, samples_in_frame_per_channel: u16, frame_size: u16) {
+fn write_frame_header_to_buf(
+    buf: &mut Vec<u8>,
+    num_channels: u8,
+    sample_rate: u32,
+    samples_in_frame_per_channel: u16,
+    frame_size: u16,
+) {
     buf.push(num_channels);
     // sample_rate is u24, so we take the last 3 bytes of its u32 BE representation
     let sr_bytes = sample_rate.to_be_bytes();
-    buf.extend_from_slice(&sr_bytes[1..4]); 
+    buf.extend_from_slice(&sr_bytes[1..4]);
     buf.extend_from_slice(&samples_in_frame_per_channel.to_be_bytes());
     buf.extend_from_slice(&frame_size.to_be_bytes());
 }
@@ -702,12 +734,16 @@ pub fn encode_frame(
 ) -> Result<(FrameHeader, Vec<u8>), EncodeError> {
     // 1. Input Validation
     if input_samples_per_channel.is_empty() || lms_states.is_empty() {
-        return Err(EncodeError::InvalidInput("Input samples or LMS states cannot be empty."));
+        return Err(EncodeError::InvalidInput(
+            "Input samples or LMS states cannot be empty.",
+        ));
     }
 
     let num_channels = input_samples_per_channel.len();
     if num_channels != lms_states.len() {
-        return Err(EncodeError::InvalidInput("Number of channels in samples and LMS states must match."));
+        return Err(EncodeError::InvalidInput(
+            "Number of channels in samples and LMS states must match.",
+        ));
     }
     if num_channels > u8::MAX as usize {
         return Err(EncodeError::UnsupportedChannelCount); // Or InvalidInput
@@ -719,37 +755,48 @@ pub fn encode_frame(
 
     let num_samples_this_frame_per_channel = input_samples_per_channel[0].len();
     if num_samples_this_frame_per_channel == 0 {
-        return Err(EncodeError::InvalidInput("Number of samples per channel cannot be zero."));
+        return Err(EncodeError::InvalidInput(
+            "Number of samples per channel cannot be zero.",
+        ));
     }
 
     for c in 1..num_channels {
         if input_samples_per_channel[c].len() != num_samples_this_frame_per_channel {
-            return Err(EncodeError::InvalidInput("All channels must have the same number of samples."));
+            return Err(EncodeError::InvalidInput(
+                "All channels must have the same number of samples.",
+            ));
         }
     }
 
     if num_samples_this_frame_per_channel % QOA_SLICE_LEN != 0 {
-        return Err(EncodeError::InvalidInput("Number of samples per channel must be a multiple of QOA_SLICE_LEN."));
-    }
-    
-    let num_slices_per_channel = num_samples_this_frame_per_channel / QOA_SLICE_LEN;
-    if num_slices_per_channel > MAX_SLICES_PER_CHANNEL_PER_FRAME {
-        return Err(EncodeError::InvalidInput("Number of slices per channel exceeds MAX_SLICES_PER_CHANNEL_PER_FRAME."));
-    }
-    if num_samples_this_frame_per_channel > u16::MAX as usize {
-         return Err(EncodeError::InvalidInput("Number of samples per channel exceeds u16::MAX."));
+        return Err(EncodeError::InvalidInput(
+            "Number of samples per channel must be a multiple of QOA_SLICE_LEN.",
+        ));
     }
 
+    let num_slices_per_channel = num_samples_this_frame_per_channel / QOA_SLICE_LEN;
+    if num_slices_per_channel > MAX_SLICES_PER_CHANNEL_PER_FRAME {
+        return Err(EncodeError::InvalidInput(
+            "Number of slices per channel exceeds MAX_SLICES_PER_CHANNEL_PER_FRAME.",
+        ));
+    }
+    if num_samples_this_frame_per_channel > u16::MAX as usize {
+        return Err(EncodeError::InvalidInput(
+            "Number of samples per channel exceeds u16::MAX.",
+        ));
+    }
 
     // 2. Calculate Frame Parameters & Validate Frame Size
     // LMS state: 4 history (i16) + 4 weights (i16) = 8 i16s = 16 bytes per channel
-    let lms_data_size: usize = num_channels * 16; 
+    let lms_data_size: usize = num_channels * 16;
     let num_total_slices: usize = num_slices_per_channel * num_channels;
     let slices_data_size: usize = num_total_slices * 8; // Each slice is 8 bytes (u64)
 
     let calculated_frame_size_usize: usize = QOA_HEADER_SIZE + lms_data_size + slices_data_size;
     if calculated_frame_size_usize > u16::MAX as usize {
-        return Err(EncodeError::InvalidInput("Calculated frame size exceeds u16::MAX. Consider fewer channels or samples per frame."));
+        return Err(EncodeError::InvalidInput(
+            "Calculated frame size exceeds u16::MAX. Consider fewer channels or samples per frame.",
+        ));
     }
     let frame_size_val = calculated_frame_size_usize as u16;
 
@@ -762,14 +809,13 @@ pub fn encode_frame(
         sample_rate,
         num_samples_per_channel: num_samples_this_frame_per_channel as u16,
     };
-    
+
     // Write header using helper or manually
     frame_bytes.push(frame_header_struct.num_channels);
     let sr_bytes = frame_header_struct.sample_rate.to_be_bytes();
     frame_bytes.extend_from_slice(&sr_bytes[1..4]); // u24 for sample_rate
     frame_bytes.extend_from_slice(&frame_header_struct.num_samples_per_channel.to_be_bytes());
     frame_bytes.extend_from_slice(&frame_size_val.to_be_bytes());
-
 
     // 5. Write LMS States (num_channels * 16 bytes)
     for c in 0..num_channels {
@@ -788,8 +834,9 @@ pub fn encode_frame(
             let start = slice_idx * QOA_SLICE_LEN;
             let end = start + QOA_SLICE_LEN;
             let current_slice_samples = &input_samples_per_channel[c][start..end];
-            
-            let (encoded_slice_u64, _reconstructed_samples) = encode_slice(current_slice_samples, &mut lms_states[c])?;
+
+            let (encoded_slice_u64, _reconstructed_samples) =
+                encode_slice(current_slice_samples, &mut lms_states[c])?;
             frame_bytes.extend_from_slice(&encoded_slice_u64.to_be_bytes());
         }
     }
@@ -798,7 +845,6 @@ pub fn encode_frame(
     // 7. Return
     Ok((frame_header_struct, frame_bytes))
 }
-
 
 impl Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -998,7 +1044,7 @@ mod encoder_tests {
         // find_best_scale_factor_quantized_and_dequantized tests
         let (sf, q_idx, dequant_val) = find_best_scale_factor_quantized_and_dequantized(0);
         assert_eq!((sf, q_idx, dequant_val), (0, 1, -1), "Residual 0");
-        
+
         let (sf, q_idx, dequant_val) = find_best_scale_factor_quantized_and_dequantized(8);
         assert_eq!((sf, q_idx, dequant_val), (0, 6, 7), "Residual 8");
 
@@ -1017,7 +1063,7 @@ mod encoder_tests {
         // Generate Original Audio Data: original_audio_data[frame_idx][channel_idx][sample_idx_in_frame]
         let mut original_audio_data: Vec<Vec<Vec<i16>>> =
             vec![vec![vec![0i16; samples_per_frame_per_channel]; num_channels]; num_frames];
-        
+
         let mut global_sample_idx_per_channel = vec![0usize; num_channels];
 
         for frame_idx in 0..num_frames {
@@ -1030,7 +1076,7 @@ mod encoder_tests {
                 }
             }
         }
-        
+
         // Encode
         let mut writer = Cursor::new(Vec::new());
         let mut encoder = QoaEncoder::new(
@@ -1046,13 +1092,19 @@ mod encoder_tests {
         }
         encoder.finish()?;
         let encoded_bytes = writer.into_inner();
-        assert!(!encoded_bytes.is_empty(), "Encoded bytes should not be empty");
+        assert!(
+            !encoded_bytes.is_empty(),
+            "Encoded bytes should not be empty"
+        );
 
         // Decode
         let reader = Cursor::new(encoded_bytes); // reader needs to be mutable for decode_all
         let decoded_qoa = decode_all(reader)?;
 
-        assert_eq!(decoded_qoa.num_channels, num_channels as u8, "Channel count mismatch");
+        assert_eq!(
+            decoded_qoa.num_channels, num_channels as u8,
+            "Channel count mismatch"
+        );
         assert_eq!(decoded_qoa.sample_rate, sample_rate, "Sample rate mismatch");
         assert_eq!(
             decoded_qoa.samples.len(),
