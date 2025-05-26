@@ -386,6 +386,8 @@ where
         }
         Ok(())
     }
+
+    // The entire erroneous associated function 'test_ffmpeg_roundtrip' is removed from this impl block.
 }
 
 impl QoaDecoder<io::BufReader<File>> {
@@ -1037,6 +1039,7 @@ mod tests {
 #[cfg(test)]
 mod encoder_tests {
     use super::*;
+    // use std::fs; // Commented out to test if it's truly unused
     use std::io::Cursor;
 
     #[test]

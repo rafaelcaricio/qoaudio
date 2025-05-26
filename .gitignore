@@ -12,3 +12,4 @@ Cargo.lock
 *.sw?
 
 .env
+test_audio.raw
