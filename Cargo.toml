@@ -22,6 +22,11 @@ name = "play"
 path = "examples/play.rs"
 required-features = ["rodio"]
 
+[[example]]
+name = "encode_ffmpeg_stream"
+path = "examples/encode_ffmpeg_stream.rs"
+# No required-features for this example currently
+
 [[bench]]
 name = "qoa_benchmarks"
 harness = false
