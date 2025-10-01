@@ -477,18 +477,24 @@ impl QoaEncoder {
                 let dequantized = QOA_DEQUANT_TAB[scalefactor][quantized];
                 let reconstructed = (predicted + dequantized).clamp(-32768, 32767) as i16;
 
-                // Add weights penalty
-                let weights_penalty = ((lms.weights[0].pow(2)
-                    + lms.weights[1].pow(2)
-                    + lms.weights[2].pow(2)
-                    + lms.weights[3].pow(2))
-                    >> 18)
-                    - 0x8ff;
-                let weights_penalty = weights_penalty.max(0);
+                // Add weights penalty using widened arithmetic to avoid overflow
+                let weights_sq_sum: i64 = lms
+                    .weights
+                    .iter()
+                    .map(|w| {
+                        let w = *w as i64;
+                        w * w
+                    })
+                    .sum();
+                let mut weights_penalty = (weights_sq_sum >> 18) - 0x8ff;
+                if weights_penalty < 0 {
+                    weights_penalty = 0;
+                }
 
                 let error = (sample as i32 - reconstructed as i32) as i64;
                 let error_sq = error * error;
-                current_rank += error_sq as u64 + (weights_penalty * weights_penalty) as u64;
+                let weights_penalty_sq = weights_penalty * weights_penalty;
+                current_rank += error_sq as u64 + weights_penalty_sq as u64;
 
                 if current_rank > best_rank {
                     valid = false;
@@ -521,8 +527,9 @@ const fn qoa_frame_size(channels: usize, slices: usize) -> u16 {
 /// QOA division with rounding away from zero
 #[inline(always)]
 fn qoa_div(v: i32, scalefactor: usize) -> i32 {
-    let reciprocal = QOA_RECIPROCAL_TAB[scalefactor];
-    let n = (v * reciprocal + (1 << 15)) >> 16;
+    let reciprocal = QOA_RECIPROCAL_TAB[scalefactor] as i64;
+    let v64 = v as i64;
+    let n = ((v64 * reciprocal + (1_i64 << 15)) >> 16) as i32;
     n + ((v > 0) as i32 - (v < 0) as i32) - ((n > 0) as i32 - (n < 0) as i32)
 }
 
