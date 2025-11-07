@@ -22,6 +22,10 @@ name = "play"
 path = "examples/play.rs"
 required-features = ["rodio"]
 
+[[example]]
+name = "encode"
+path = "examples/encode.rs"
+
 [[bench]]
 name = "qoa_benchmarks"
 harness = false
