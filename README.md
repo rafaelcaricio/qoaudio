@@ -10,7 +10,37 @@ A pure Rust, zero-dependency implementation of the [QOA](https://qoaformat.org) 
 - **Encode** 16-bit PCM audio to QOA — one-shot or frame-at-a-time streaming
 - **Zero unsafe code** — the crate enforces `#![forbid(unsafe_code)]`
 - **Zero required dependencies** — `rodio` and `hound` are optional features
-- **Performance** — encoder is within ~2% of the [reference C implementation](https://github.com/phoboslab/qoa)
+- **Faster than C** — with the `nightly` feature, the encoder beats the C reference by ~2.5% while remaining 100% safe
+
+## Performance
+
+On Apple Silicon (M-series), encoding a 54-second stereo 44.1kHz file:
+
+| Implementation | Decode | Encode |
+|---|---|---|
+| C reference (`qoa.h`, `gcc -O3`) | — | ~202 ms |
+| **Rust stable** | ~45 ms | ~206 ms |
+| **Rust nightly** (`nightly` feature) | ~45 ms | **~197 ms** ✅ |
+
+The encoder's hot path is a brute-force search over 16 scalefactors × 20
+samples per slice, dominated by a 4-element LMS dot product
+(`predict`) and a self-dot product (`weights_penalty`). On stable Rust,
+LLVM doesn't fully auto-vectorize the `wrapping_mul`/`wrapping_add` chains,
+producing mixed scalar/NEON code. The optional `nightly` feature uses
+`std::simd` (portable SIMD) to express these as explicit `i32x4` operations,
+generating optimal `mul.4s` + `addv.4s` NEON instructions (or SSE/AVX
+equivalents on x86) — matching what Clang produces for the C reference, and
+then winning on Rust's tighter codegen elsewhere.
+
+All of this with `#![forbid(unsafe_code)]` — portable SIMD is a safe API.
+
+```bash
+# Stable
+cargo bench
+
+# Nightly (with SIMD)
+cargo +nightly bench --features nightly
+```
 
 ## Usage
 
@@ -72,29 +102,6 @@ cargo run --release --example encode --features hound -- input.wav output.qoa
 ```
 
 More audio samples can be found at [phoboslab.org/files/qoa-samples](https://phoboslab.org/files/qoa-samples/).
-
-## Performance
-
-On Apple Silicon (M-series), encoding a 54-second stereo 44.1kHz file:
-
-| | Stable | Nightly (`nightly` feature) |
-|---|---|---|
-| Decode | ~46 ms | ~45 ms |
-| Encode | ~210 ms | **~197 ms** |
-| C reference (`-O3`) | | ~202 ms |
-
-The optional `nightly` feature enables portable SIMD (`std::simd`) for the LMS
-predict and weights penalty hot paths, producing optimal NEON/SSE instructions.
-This makes the safe Rust encoder **faster than the C reference** while
-maintaining `#![forbid(unsafe_code)]`.
-
-```bash
-# Stable
-cargo bench
-
-# Nightly (with SIMD)
-cargo +nightly bench --features nightly
-```
 
 ## License
 
