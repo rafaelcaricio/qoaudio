@@ -25,3 +25,9 @@ name = "iter_all"
 path = "fuzz_targets/iter_all.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "encode_round_trip"
+path = "fuzz_targets/encode_round_trip.rs"
+test = false
+doc = false

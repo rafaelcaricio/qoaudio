@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(feature = "nightly", feature(portable_simd))]
 //! # QOA - Quite OK Audio Format
 //!
-//! A library for decoding qoa files.
+//! A library for encoding and decoding qoa files.
 use std::fmt::Display;
 use std::fs::File;
 use std::io::Cursor;
@@ -14,6 +15,17 @@ pub const QOA_LMS_LEN: usize = 4;
 pub const QOA_HEADER_SIZE: usize = 8;
 pub const QOA_MAGIC: u32 = u32::from_be_bytes(*b"qoaf");
 pub const MAX_SLICES_PER_CHANNEL_PER_FRAME: usize = 256;
+pub const QOA_SLICES_PER_FRAME: usize = 256;
+pub const QOA_FRAME_LEN: usize = QOA_SLICES_PER_FRAME * QOA_SLICE_LEN;
+pub const QOA_MAX_CHANNELS: usize = 8;
+
+/// QOA encoder quantization table
+const QOA_QUANT_TAB: [i32; 17] = [7, 7, 7, 5, 5, 3, 3, 1, 0, 0, 2, 2, 4, 4, 6, 6, 6];
+
+/// QOA encoder reciprocal table
+const QOA_RECIPROCAL_TAB: [i32; 16] = [
+    65536, 9363, 3121, 1457, 781, 475, 311, 216, 156, 117, 90, 71, 57, 47, 39, 32,
+];
 
 /// The decoding mode of the QOA file.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +71,52 @@ pub struct QoaDecoder<R> {
 struct QoaLms {
     history: [i32; QOA_LMS_LEN],
     weights: [i32; QOA_LMS_LEN],
+}
+
+/// Encoder for QOA files.
+///
+/// Encodes 16-bit PCM audio into QOA format using lossy compression.
+/// The encoder uses LMS prediction and quantization to achieve compression.
+///
+/// Supports both one-shot encoding via [`encode`](QoaEncoder::encode) and
+/// frame-at-a-time streaming via [`write_header`](QoaEncoder::write_header)
+/// followed by repeated [`encode_frame`](QoaEncoder::encode_frame) calls.
+#[derive(Debug)]
+pub struct QoaEncoder {
+    /// Number of audio channels
+    channels: u8,
+    /// Sample rate in Hz
+    sample_rate: u32,
+    /// Total number of samples per channel
+    samples: u32,
+    /// LMS state for each channel
+    lms: Vec<QoaLms>,
+    /// Previous scale factor per channel (persists across frames for streaming)
+    prev_scalefactor: Vec<usize>,
+}
+
+/// Description of QOA file properties for encoding
+#[derive(Debug, Clone)]
+pub struct QoaDesc {
+    /// Number of audio channels (1-8)
+    pub channels: u8,
+    /// Sample rate in Hz
+    pub sample_rate: u32,
+    /// Total number of samples per channel
+    pub samples: u32,
+}
+
+/// Errors that can occur during QOA encoding
+#[derive(Debug)]
+pub enum EncodeError {
+    /// Invalid number of channels (must be 1-8)
+    InvalidChannels,
+    /// Invalid sample rate (must be > 0)
+    InvalidSampleRate,
+    /// Invalid number of samples (must be > 0)
+    InvalidSamples,
+    /// I/O error
+    IoError(io::Error),
 }
 
 impl<R> QoaDecoder<R>
@@ -182,7 +240,7 @@ where
         let data_size = frame_size as usize - non_sample_data_size;
         let num_slices = data_size / 8;
 
-        if num_slices % num_channels as usize != 0 {
+        if !num_slices.is_multiple_of(num_channels as usize) {
             return Err(DecodeError::InvalidFrameHeader);
         }
         if num_slices / num_channels as usize > MAX_SLICES_PER_CHANNEL_PER_FRAME {
@@ -277,6 +335,246 @@ where
         }
         Ok(())
     }
+}
+
+impl QoaEncoder {
+    /// Create a new QOA encoder with the specified parameters.
+    pub fn new(desc: &QoaDesc) -> Result<Self, EncodeError> {
+        if desc.channels == 0 || desc.channels > QOA_MAX_CHANNELS as u8 {
+            return Err(EncodeError::InvalidChannels);
+        }
+        if desc.sample_rate == 0 {
+            return Err(EncodeError::InvalidSampleRate);
+        }
+        if desc.samples == 0 {
+            return Err(EncodeError::InvalidSamples);
+        }
+
+        let mut lms = Vec::with_capacity(desc.channels as usize);
+        for _ in 0..desc.channels {
+            lms.push(QoaLms {
+                history: [0; QOA_LMS_LEN],
+                weights: [0, 0, -(1 << 13), 1 << 14],
+            });
+        }
+
+        let prev_scalefactor = vec![0; desc.channels as usize];
+
+        Ok(Self {
+            channels: desc.channels,
+            sample_rate: desc.sample_rate,
+            samples: desc.samples,
+            lms,
+            prev_scalefactor,
+        })
+    }
+
+    /// Encode all PCM audio data to QOA format in one shot.
+    ///
+    /// The length of `sample_data` must equal `samples * channels` as specified
+    /// in the [`QoaDesc`] passed to [`QoaEncoder::new`].
+    pub fn encode(&mut self, sample_data: &[i16]) -> Result<Vec<u8>, EncodeError> {
+        if sample_data.len() != self.samples as usize * self.channels as usize {
+            return Err(EncodeError::InvalidSamples);
+        }
+
+        let channels = self.channels as usize;
+        let total = self.samples as usize;
+        let num_slices = total.div_ceil(QOA_SLICE_LEN);
+        let num_frames = total.div_ceil(QOA_FRAME_LEN);
+        let estimated_size = QOA_HEADER_SIZE
+            + num_frames * (8 + QOA_LMS_LEN * 4 * channels)
+            + num_slices * 8 * channels;
+        let mut encoded = Vec::with_capacity(estimated_size);
+        self.write_header(&mut encoded)?;
+
+        let mut sample_index = 0usize;
+        while sample_index < total {
+            let frame_len = (total - sample_index).min(QOA_FRAME_LEN);
+            let start = sample_index * channels;
+            let end = (sample_index + frame_len) * channels;
+            self.encode_frame(&sample_data[start..end], &mut encoded)?;
+            sample_index += frame_len;
+        }
+
+        Ok(encoded)
+    }
+
+    /// Write the 8-byte QOA file header.
+    ///
+    /// Call this once before any [`encode_frame`](QoaEncoder::encode_frame)
+    /// calls when using the streaming API.
+    pub fn write_header<W: io::Write>(&self, writer: &mut W) -> Result<(), EncodeError> {
+        writer.write_all(&QOA_MAGIC.to_be_bytes())?;
+        writer.write_all(&self.samples.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Encode one frame of interleaved PCM samples and write it to `writer`.
+    ///
+    /// `sample_data` must contain interleaved samples for all channels, with at
+    /// most `QOA_FRAME_LEN * channels` samples. Its length must be a multiple
+    /// of `channels`. LMS state is preserved across calls, so frames can be
+    /// encoded incrementally.
+    ///
+    /// Returns the number of samples per channel encoded in this frame.
+    pub fn encode_frame<W: io::Write>(
+        &mut self,
+        sample_data: &[i16],
+        writer: &mut W,
+    ) -> Result<usize, EncodeError> {
+        let channels = self.channels as usize;
+        if sample_data.is_empty() || !sample_data.len().is_multiple_of(channels) {
+            return Err(EncodeError::InvalidSamples);
+        }
+        let frame_len = sample_data.len() / channels;
+        if frame_len > QOA_FRAME_LEN {
+            return Err(EncodeError::InvalidSamples);
+        }
+
+        let slices = frame_len.div_ceil(QOA_SLICE_LEN);
+        let frame_size = qoa_frame_size(channels, slices);
+
+        // Frame header
+        let header = ((self.channels as u64) << 56)
+            | ((self.sample_rate as u64) << 32)
+            | ((frame_len as u64) << 16)
+            | (frame_size as u64);
+        writer.write_all(&header.to_be_bytes())?;
+
+        // LMS state per channel
+        for c in 0..channels {
+            let mut history = 0u64;
+            let mut weights = 0u64;
+            for i in 0..QOA_LMS_LEN {
+                history = (history << 16) | (self.lms[c].history[i] as u16 as u64);
+                weights = (weights << 16) | (self.lms[c].weights[i] as u16 as u64);
+            }
+            writer.write_all(&history.to_be_bytes())?;
+            writer.write_all(&weights.to_be_bytes())?;
+        }
+
+        // Encode slices
+        for sample_index in (0..frame_len).step_by(QOA_SLICE_LEN) {
+            for c in 0..channels {
+                let slice_len = (frame_len - sample_index).min(QOA_SLICE_LEN);
+                let slice_start = sample_index * channels + c;
+                let slice_end = (sample_index + slice_len) * channels + c;
+
+                let (best_slice, best_scalefactor, best_lms) = self.encode_slice(
+                    sample_data,
+                    slice_start,
+                    slice_end,
+                    channels,
+                    self.prev_scalefactor[c],
+                );
+
+                self.prev_scalefactor[c] = best_scalefactor;
+                self.lms[c] = best_lms;
+
+                let mut slice_data = best_slice;
+                if slice_len < QOA_SLICE_LEN {
+                    slice_data <<= (QOA_SLICE_LEN - slice_len) * 3;
+                }
+                writer.write_all(&slice_data.to_be_bytes())?;
+            }
+        }
+        Ok(frame_len)
+    }
+
+    fn encode_slice(
+        &self,
+        sample_data: &[i16],
+        slice_start: usize,
+        slice_end: usize,
+        channels: usize,
+        prev_scalefactor: usize,
+    ) -> (u64, usize, QoaLms) {
+        // Gather channel samples into a contiguous buffer. This converts the
+        // strided interleaved access into sequential access, letting the
+        // compiler prove all indices are in-bounds for the inner loop and
+        // improving cache locality.
+        let mut samples = [0i32; QOA_SLICE_LEN];
+        let mut slice_len = 0;
+        for si in (slice_start..slice_end).step_by(channels) {
+            samples[slice_len] = sample_data[si] as i32;
+            slice_len += 1;
+        }
+        // Help the compiler prove slice_len <= QOA_SLICE_LEN so it can
+        // eliminate bounds checks on samples[i] in the inner loop.
+        let slice_len = slice_len.min(QOA_SLICE_LEN);
+
+        let channel_lms = &self.lms[slice_start % channels];
+        let mut best_rank = u64::MAX;
+        let mut best_slice = 0u64;
+        let mut best_scalefactor = 0;
+        let mut best_lms = QoaLms::default();
+
+        for sfi in 0..16 {
+            let scalefactor = (sfi + prev_scalefactor) & 15;
+            let sf_dequant = &QOA_DEQUANT_TAB[scalefactor];
+
+            let mut lms = channel_lms.clone();
+            let mut slice = scalefactor as u64;
+            let mut current_rank = 0u64;
+
+            let mut valid = true;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..slice_len {
+                let sample = samples[i];
+                let predicted = lms.predict();
+                let residual = sample - predicted;
+                let scaled = qoa_div(residual, scalefactor);
+                let clamped = scaled.clamp(-8, 8);
+                let quantized = QOA_QUANT_TAB[(clamped + 8) as usize] as usize;
+                let dequantized = sf_dequant[quantized & 7];
+                let reconstructed = (predicted + dequantized).clamp(-32768, 32767);
+
+                let weights_penalty = lms.weights_penalty();
+
+                let error = (sample - reconstructed) as i64;
+                let penalty = weights_penalty as i64;
+                current_rank += (error * error) as u64 + (penalty * penalty) as u64;
+
+                if current_rank > best_rank {
+                    valid = false;
+                    break;
+                }
+
+                lms.update(reconstructed as i16, dequantized);
+                slice = (slice << 3) | quantized as u64;
+            }
+
+            if valid && current_rank < best_rank {
+                best_rank = current_rank;
+                best_slice = slice;
+                best_scalefactor = scalefactor;
+                best_lms = lms;
+            }
+        }
+
+        (best_slice, best_scalefactor, best_lms)
+    }
+}
+
+// QoaLms methods are already implemented above
+
+/// Calculate frame size for QOA encoding
+const fn qoa_frame_size(channels: usize, slices: usize) -> u16 {
+    (8 + QOA_LMS_LEN * 4 * channels + 8 * slices * channels) as u16
+}
+
+/// QOA division with rounding away from zero.
+///
+/// Uses wrapping 32-bit arithmetic matching the C reference, which allows the
+/// compiler to emit a single fused multiply-add. For large residuals this can
+/// wrap, but the result only affects encoder scalefactor selection (a heuristic)
+/// — the decoder always reads the exact quantized values from the bitstream.
+#[inline(always)]
+fn qoa_div(v: i32, scalefactor: usize) -> i32 {
+    let reciprocal = QOA_RECIPROCAL_TAB[scalefactor];
+    let n = v.wrapping_mul(reciprocal).wrapping_add(1 << 15) >> 16;
+    n + ((v > 0) as i32 - (v < 0) as i32) - ((n > 0) as i32 - (n < 0) as i32)
 }
 
 impl QoaDecoder<io::BufReader<File>> {
@@ -415,6 +713,15 @@ pub fn open_and_decode_all<P: AsRef<Path>>(path: P) -> Result<DecodedQoa, Decode
     decode_all(reader)
 }
 
+/// Encode PCM audio data to QOA format.
+///
+/// This is a convenience function that creates an encoder and encodes the provided
+/// PCM audio data in one step.
+pub fn encode_all(sample_data: &[i16], desc: &QoaDesc) -> Result<Vec<u8>, EncodeError> {
+    let mut encoder = QoaEncoder::new(desc)?;
+    encoder.encode(sample_data)
+}
+
 #[derive(Debug, Default)]
 struct CurrentFrame {
     header: FrameHeader,
@@ -448,18 +755,45 @@ fn read_array<R: io::Read, const LEN: usize>(mut reader: R) -> io::Result<[u8; L
 }
 
 impl QoaLms {
+    #[cfg(feature = "nightly")]
+    #[inline(always)]
+    fn predict(&self) -> i32 {
+        use core::simd::prelude::*;
+        let w = i32x4::from_array(self.weights);
+        let h = i32x4::from_array(self.history);
+        (w * h).reduce_sum() >> 13
+    }
+
+    #[cfg(not(feature = "nightly"))]
     #[inline(always)]
     fn predict(&self) -> i32 {
         let mut prediction: i32 = 0;
         for i in 0..QOA_LMS_LEN {
-            // The spec does not specify a precision for these operations or
-            // how to handle overflow. The reference C implementation does
-            // not prevent signed integer overflow (undefined behavior). Since
-            // overflow should not occur in a properly encoded file, we take the
-            // lower overhead option of just allowing wrapping.
             prediction = prediction.wrapping_add(self.weights[i].wrapping_mul(self.history[i]));
         }
         prediction >> 13
+    }
+
+    /// Weights penalty for the encoder's scalefactor search heuristic.
+    #[cfg(feature = "nightly")]
+    #[inline(always)]
+    fn weights_penalty(&self) -> i32 {
+        use core::simd::prelude::*;
+        let w = i32x4::from_array(self.weights);
+        (((w * w).reduce_sum() >> 18) - 0x8ff).max(0)
+    }
+
+    /// Weights penalty for the encoder's scalefactor search heuristic.
+    #[cfg(not(feature = "nightly"))]
+    #[inline(always)]
+    fn weights_penalty(&self) -> i32 {
+        let w = &self.weights;
+        let sq = w[0]
+            .wrapping_mul(w[0])
+            .wrapping_add(w[1].wrapping_mul(w[1]))
+            .wrapping_add(w[2].wrapping_mul(w[2]))
+            .wrapping_add(w[3].wrapping_mul(w[3]));
+        ((sq >> 18) - 0x8ff).max(0)
     }
 
     #[inline(always)]
@@ -521,6 +855,25 @@ impl Display for DecodeError {
 impl From<io::Error> for DecodeError {
     fn from(inner: io::Error) -> Self {
         DecodeError::IoError(inner)
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+impl Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            EncodeError::InvalidChannels => write!(f, "Invalid number of channels (must be 1-8)"),
+            EncodeError::InvalidSampleRate => write!(f, "Invalid sample rate (must be > 0)"),
+            EncodeError::InvalidSamples => write!(f, "Invalid number of samples (must be > 0)"),
+            EncodeError::IoError(e) => write!(f, "IO error: {}", e),
+        }
+    }
+}
+
+impl From<io::Error> for EncodeError {
+    fn from(inner: io::Error) -> Self {
+        EncodeError::IoError(inner)
     }
 }
 
@@ -684,5 +1037,228 @@ mod tests {
         assert_eq!(decoded.sample_rate, 44100);
         assert_eq!(decoded.num_channels, 2);
         assert_eq!(decoded.samples.len(), 2394122 * 2);
+    }
+
+    #[test]
+    fn test_encode_decode_simple() {
+        // Create simple test data: sine wave
+        let sample_rate = 44100;
+        let duration = 0.1; // 100ms
+        let samples_per_channel = (sample_rate as f64 * duration) as u32;
+        let channels = 1;
+
+        let mut samples = Vec::new();
+        for i in 0..samples_per_channel {
+            let t = i as f64 / sample_rate as f64;
+            let sample = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 16384.0;
+            samples.push(sample as i16);
+        }
+
+        let desc = QoaDesc {
+            channels,
+            sample_rate,
+            samples: samples_per_channel,
+        };
+
+        // Encode
+        let encoded = encode_all(&samples, &desc).unwrap();
+
+        // Verify we got some data
+        assert!(encoded.len() > QOA_HEADER_SIZE);
+
+        // Decode and verify
+        let decoded = decode_all(Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.sample_rate, sample_rate);
+        assert_eq!(decoded.num_channels, channels);
+        assert_eq!(decoded.samples.len(), samples.len());
+    }
+
+    #[test]
+    fn test_encode_decode_stereo() {
+        // Create stereo test data
+        let sample_rate = 44100;
+        let duration = 0.1; // 100ms
+        let samples_per_channel = (sample_rate as f64 * duration) as u32;
+        let channels = 2;
+
+        let mut samples = Vec::new();
+        for i in 0..samples_per_channel {
+            let t = i as f64 / sample_rate as f64;
+            // Left channel: sine wave
+            let left = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 16384.0;
+            // Right channel: cosine wave
+            let right = (t * 440.0 * 2.0 * std::f64::consts::PI).cos() * 16384.0;
+            samples.push(left as i16);
+            samples.push(right as i16);
+        }
+
+        let desc = QoaDesc {
+            channels,
+            sample_rate,
+            samples: samples_per_channel,
+        };
+
+        // Encode
+        let encoded = encode_all(&samples, &desc).unwrap();
+
+        // Verify we got some data
+        assert!(encoded.len() > QOA_HEADER_SIZE);
+
+        // Decode and verify
+        let decoded = decode_all(Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.sample_rate, sample_rate);
+        assert_eq!(decoded.num_channels, channels);
+        assert_eq!(decoded.samples.len(), samples.len());
+    }
+
+    #[test]
+    fn test_encoder_errors() {
+        // Test invalid channels
+        let desc = QoaDesc {
+            channels: 0,
+            sample_rate: 44100,
+            samples: 1000,
+        };
+        let samples = vec![0i16; 1000];
+        assert!(matches!(
+            encode_all(&samples, &desc),
+            Err(EncodeError::InvalidChannels)
+        ));
+
+        // Test invalid sample rate
+        let desc = QoaDesc {
+            channels: 1,
+            sample_rate: 0,
+            samples: 1000,
+        };
+        assert!(matches!(
+            encode_all(&samples, &desc),
+            Err(EncodeError::InvalidSampleRate)
+        ));
+
+        // Test invalid samples
+        let desc = QoaDesc {
+            channels: 1,
+            sample_rate: 44100,
+            samples: 0,
+        };
+        assert!(matches!(
+            encode_all(&samples, &desc),
+            Err(EncodeError::InvalidSamples)
+        ));
+    }
+
+    #[test]
+    fn test_round_trip_audio() {
+        // Test that encode-decode preserves the basic structure
+        let sample_rate = 44100;
+        let samples_per_channel = 1000;
+        let channels = 1;
+
+        // Create test data with some variation - use a more gradual signal
+        let mut samples = Vec::new();
+        for i in 0..samples_per_channel {
+            let sample = ((i % 200) as i16 - 100) * 100;
+            samples.push(sample);
+        }
+
+        let desc = QoaDesc {
+            channels,
+            sample_rate,
+            samples: samples_per_channel,
+        };
+
+        // Encode
+        let encoded = encode_all(&samples, &desc).unwrap();
+
+        // Decode
+        let decoded = decode_all(Cursor::new(encoded)).unwrap();
+
+        // Verify basic properties
+        assert_eq!(decoded.sample_rate, sample_rate);
+        assert_eq!(decoded.num_channels, channels);
+        assert_eq!(decoded.samples.len(), samples.len());
+
+        // Verify that the decoded audio has similar characteristics
+        // (QOA is lossy, so we don't expect exact match)
+        let mut max_diff = 0;
+        for (original, decoded) in samples.iter().zip(decoded.samples.iter()) {
+            let diff = (original - decoded).abs();
+            max_diff = max_diff.max(diff);
+        }
+
+        // QOA is lossy, but the error should stay well within the i16 range
+        assert!(
+            max_diff < 8000,
+            "Maximum difference too large: {}",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn test_full_file_round_trip() {
+        // Decode the real fixture, re-encode, decode again, compare
+        let original = decode_all(Cursor::new(QOA_BYTES)).unwrap();
+        let desc = QoaDesc {
+            channels: original.num_channels,
+            sample_rate: original.sample_rate,
+            samples: (original.samples.len() / original.num_channels as usize) as u32,
+        };
+        let encoded = encode_all(&original.samples, &desc).unwrap();
+        let decoded = decode_all(Cursor::new(encoded)).unwrap();
+
+        assert_eq!(decoded.num_channels, original.num_channels);
+        assert_eq!(decoded.sample_rate, original.sample_rate);
+        assert_eq!(decoded.samples.len(), original.samples.len());
+
+        // Compute RMS error — QOA re-encoding a previously-decoded signal
+        // goes through quantization twice, but should still be reasonable
+        let mse: f64 = original
+            .samples
+            .iter()
+            .zip(decoded.samples.iter())
+            .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+            .sum::<f64>()
+            / original.samples.len() as f64;
+        let rms = mse.sqrt();
+        assert!(rms < 500.0, "RMS error too large: {:.1}", rms);
+    }
+
+    #[test]
+    fn test_streaming_encode() {
+        // Encode the fixture frame-by-frame via the streaming API,
+        // then verify the output matches one-shot encoding
+        let original = decode_all(Cursor::new(QOA_BYTES)).unwrap();
+        let channels = original.num_channels as usize;
+        let samples_per_channel = (original.samples.len() / channels) as u32;
+
+        let desc = QoaDesc {
+            channels: original.num_channels,
+            sample_rate: original.sample_rate,
+            samples: samples_per_channel,
+        };
+
+        // One-shot encode for reference
+        let mut oneshot_enc = QoaEncoder::new(&desc).unwrap();
+        let oneshot = oneshot_enc.encode(&original.samples).unwrap();
+
+        // Streaming encode
+        let mut streaming_enc = QoaEncoder::new(&desc).unwrap();
+        let mut streamed = Vec::new();
+        streaming_enc.write_header(&mut streamed).unwrap();
+
+        let mut offset = 0usize;
+        let total = samples_per_channel as usize;
+        while offset < total {
+            let frame_len = (total - offset).min(QOA_FRAME_LEN);
+            let start = offset * channels;
+            let end = (offset + frame_len) * channels;
+            streaming_enc
+                .encode_frame(&original.samples[start..end], &mut streamed)
+                .unwrap();
+            offset += frame_len;
+        }
+
+        assert_eq!(streamed, oneshot);
     }
 }
