@@ -1,9 +1,9 @@
 [package]
 name = "qoaudio"
 authors = ["Rafael Caricio <rafael@caricio.com>"]
-description = "QOA audio format decoder in Rust"
+description = "Pure Rust QOA (Quite OK Audio) encoder and decoder"
 license = "MIT OR Apache-2.0"
-version = "0.7.0"
+version = "1.0.0"
 edition = "2021"
 publish = ["crates-io"]
 repository = "https://github.com/rafaelcaricio/qoaudio"
