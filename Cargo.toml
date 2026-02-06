@@ -10,6 +10,7 @@ repository = "https://github.com/rafaelcaricio/qoaudio"
 
 [dependencies]
 rodio = { version = "0.17.1", default-features = false, optional = true }
+hound = { version = "3.5", optional = true }
 
 [dev-dependencies]
 criterion = "0.3"
@@ -21,6 +22,11 @@ default = []
 name = "play"
 path = "examples/play.rs"
 required-features = ["rodio"]
+
+[[example]]
+name = "encode"
+path = "examples/encode.rs"
+required-features = ["hound"]
 
 [[bench]]
 name = "qoa_benchmarks"
