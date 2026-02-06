@@ -31,3 +31,9 @@ required-features = ["hound"]
 [[bench]]
 name = "qoa_benchmarks"
 harness = false
+
+[profile.release]
+lto = "thin"
+
+[profile.bench]
+lto = "thin"
