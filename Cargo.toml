@@ -29,6 +29,11 @@ name = "encode"
 path = "examples/encode.rs"
 required-features = ["hound"]
 
+[[example]]
+name = "decode"
+path = "examples/decode.rs"
+required-features = ["hound"]
+
 [[bench]]
 name = "qoa_benchmarks"
 harness = false
