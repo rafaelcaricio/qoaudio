@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(feature = "nightly", feature(portable_simd))]
 //! # QOA - Quite OK Audio Format
 //!
 //! A library for encoding and decoding qoa files.
@@ -529,15 +530,7 @@ impl QoaEncoder {
                 let dequantized = sf_dequant[quantized & 7];
                 let reconstructed = (predicted + dequantized).clamp(-32768, 32767);
 
-                let w = &lms.weights;
-                let weights_penalty = (w[0]
-                    .wrapping_mul(w[0])
-                    .wrapping_add(w[1].wrapping_mul(w[1]))
-                    .wrapping_add(w[2].wrapping_mul(w[2]))
-                    .wrapping_add(w[3].wrapping_mul(w[3]))
-                    >> 18)
-                    - 0x8ff;
-                let weights_penalty = weights_penalty.max(0);
+                let weights_penalty = lms.weights_penalty();
 
                 let error = (sample - reconstructed) as i64;
                 let penalty = weights_penalty as i64;
@@ -762,18 +755,45 @@ fn read_array<R: io::Read, const LEN: usize>(mut reader: R) -> io::Result<[u8; L
 }
 
 impl QoaLms {
+    #[cfg(feature = "nightly")]
+    #[inline(always)]
+    fn predict(&self) -> i32 {
+        use core::simd::prelude::*;
+        let w = i32x4::from_array(self.weights);
+        let h = i32x4::from_array(self.history);
+        (w * h).reduce_sum() >> 13
+    }
+
+    #[cfg(not(feature = "nightly"))]
     #[inline(always)]
     fn predict(&self) -> i32 {
         let mut prediction: i32 = 0;
         for i in 0..QOA_LMS_LEN {
-            // The spec does not specify a precision for these operations or
-            // how to handle overflow. The reference C implementation does
-            // not prevent signed integer overflow (undefined behavior). Since
-            // overflow should not occur in a properly encoded file, we take the
-            // lower overhead option of just allowing wrapping.
             prediction = prediction.wrapping_add(self.weights[i].wrapping_mul(self.history[i]));
         }
         prediction >> 13
+    }
+
+    /// Weights penalty for the encoder's scalefactor search heuristic.
+    #[cfg(feature = "nightly")]
+    #[inline(always)]
+    fn weights_penalty(&self) -> i32 {
+        use core::simd::prelude::*;
+        let w = i32x4::from_array(self.weights);
+        (((w * w).reduce_sum() >> 18) - 0x8ff).max(0)
+    }
+
+    /// Weights penalty for the encoder's scalefactor search heuristic.
+    #[cfg(not(feature = "nightly"))]
+    #[inline(always)]
+    fn weights_penalty(&self) -> i32 {
+        let w = &self.weights;
+        let sq = w[0]
+            .wrapping_mul(w[0])
+            .wrapping_add(w[1].wrapping_mul(w[1]))
+            .wrapping_add(w[2].wrapping_mul(w[2]))
+            .wrapping_add(w[3].wrapping_mul(w[3]));
+        ((sq >> 18) - 0x8ff).max(0)
     }
 
     #[inline(always)]

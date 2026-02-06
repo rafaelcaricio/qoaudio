@@ -17,6 +17,7 @@ criterion = "0.3"
 
 [features]
 default = []
+nightly = []
 
 [[example]]
 name = "play"

@@ -73,18 +73,27 @@ cargo run --release --example encode --features hound -- input.wav output.qoa
 
 More audio samples can be found at [phoboslab.org/files/qoa-samples](https://phoboslab.org/files/qoa-samples/).
 
-## Benchmarks
+## Performance
 
 On Apple Silicon (M-series), encoding a 54-second stereo 44.1kHz file:
 
-| | Time |
-|---|---|
-| Decode | ~46 ms |
-| Encode | ~210 ms |
-| C reference (`-O3`) | ~206 ms |
+| | Stable | Nightly (`nightly` feature) |
+|---|---|---|
+| Decode | ~46 ms | ~45 ms |
+| Encode | ~210 ms | **~197 ms** |
+| C reference (`-O3`) | | ~202 ms |
+
+The optional `nightly` feature enables portable SIMD (`std::simd`) for the LMS
+predict and weights penalty hot paths, producing optimal NEON/SSE instructions.
+This makes the safe Rust encoder **faster than the C reference** while
+maintaining `#![forbid(unsafe_code)]`.
 
 ```bash
+# Stable
 cargo bench
+
+# Nightly (with SIMD)
+cargo +nightly bench --features nightly
 ```
 
 ## License
