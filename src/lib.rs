@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(feature = "nightly", feature(portable_simd))]
 //! # QOA - Quite OK Audio Format
 //!
 //! A library for encoding and decoding qoa files.
@@ -68,11 +67,12 @@ pub struct QoaDecoder<R> {
     reader: R,
     current_frame: CurrentFrame,
     pending_samples: Box<[i16]>,
+    pending_samples_end: usize,
     next_pending_sample_idx: usize,
     returned_first_frame_header: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct QoaLms {
     history: [i32; QOA_LMS_LEN],
     weights: [i32; QOA_LMS_LEN],
@@ -162,6 +162,7 @@ where
             reader,
             current_frame,
             pending_samples: Box::new([]),
+            pending_samples_end: 0,
             next_pending_sample_idx: 0,
             returned_first_frame_header: false,
         };
@@ -298,7 +299,7 @@ where
     }
 
     fn decode_one_slice_per_channel(&mut self) -> Result<(), DecodeError> {
-        assert!(self.next_pending_sample_idx >= self.pending_samples.len());
+        assert!(self.next_pending_sample_idx >= self.pending_samples_end);
         let channels = self.current_frame.header.num_channels as usize;
         let full_slices_num_samples = QOA_SLICE_LEN * channels;
         if self.pending_samples.len() != full_slices_num_samples {
@@ -327,15 +328,10 @@ where
         let num_samples_per_channel = self.current_frame.num_samples_per_channel_remaining;
         if (num_samples_per_channel as usize) < QOA_SLICE_LEN {
             let total_num_samples = num_samples_per_channel as usize * channels;
-            // If this is the last slice of the file, it might not have all 20
-            // samples and be zero filled. Cut off the excess 0 samples. This
-            // is done after the loop so the loop can have a constant size for
-            // better compiler optimizations.
-            self.pending_samples = self.pending_samples[0..total_num_samples]
-                .to_vec()
-                .into_boxed_slice();
+            self.pending_samples_end = total_num_samples;
             self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel;
         } else {
+            self.pending_samples_end = full_slices_num_samples;
             self.current_frame.num_samples_per_channel_remaining -= QOA_SLICE_LEN as u16;
         }
         Ok(())
@@ -519,7 +515,7 @@ impl QoaEncoder {
             let scalefactor = (offset + prev_scalefactor) & 15;
             let sf_dequant = &QOA_DEQUANT_TAB[scalefactor];
 
-            let mut lms = channel_lms.clone();
+            let mut lms = *channel_lms;
             let mut slice = scalefactor as u64;
             let mut current_rank = 0u64;
 
@@ -528,6 +524,7 @@ impl QoaEncoder {
             for i in 0..slice_len {
                 let sample = samples[i];
                 let predicted = lms.predict();
+                let penalty = lms.weights_penalty() as i64;
                 let residual = sample - predicted;
                 let scaled = qoa_div(residual, scalefactor);
                 let clamped = scaled.clamp(-8, 8);
@@ -536,7 +533,6 @@ impl QoaEncoder {
                 let reconstructed = (predicted + dequantized).clamp(-32768, 32767);
 
                 let error = (sample - reconstructed) as i64;
-                let penalty = lms.weights_penalty() as i64;
                 current_rank += (error * error) as u64 + (penalty * penalty) as u64;
 
                 if current_rank > best_rank {
@@ -630,9 +626,10 @@ impl<R: io::Read> Iterator for QoaDecoder<R> {
     /// If an error is returned, iteration should be considered finished and
     /// next should not be called again.
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sample) = self.pending_samples.get(self.next_pending_sample_idx) {
+        if self.next_pending_sample_idx < self.pending_samples_end {
+            let sample = self.pending_samples[self.next_pending_sample_idx];
             self.next_pending_sample_idx += 1;
-            return Some(Ok(QoaItem::Sample(*sample)));
+            return Some(Ok(QoaItem::Sample(sample)));
         }
         if !self.returned_first_frame_header {
             // For consistency return the header read in the `new` function.
@@ -650,7 +647,7 @@ impl<R: io::Read> Iterator for QoaDecoder<R> {
                 Err(e) => Some(Err(e)),
             };
         }
-        debug_assert!(!self.pending_samples.is_empty());
+        debug_assert!(self.pending_samples_end > 0);
         self.next()
     }
 }
@@ -758,16 +755,6 @@ fn read_array<R: io::Read, const LEN: usize>(mut reader: R) -> io::Result<[u8; L
 }
 
 impl QoaLms {
-    #[cfg(feature = "nightly")]
-    #[inline(always)]
-    fn predict(&self) -> i32 {
-        use core::simd::prelude::*;
-        let w = i32x4::from_array(self.weights);
-        let h = i32x4::from_array(self.history);
-        (w * h).reduce_sum() >> 13
-    }
-
-    #[cfg(not(feature = "nightly"))]
     #[inline(always)]
     fn predict(&self) -> i32 {
         let mut prediction: i32 = 0;
@@ -777,17 +764,6 @@ impl QoaLms {
         prediction >> 13
     }
 
-    /// Weights penalty for the encoder's scalefactor search heuristic.
-    #[cfg(feature = "nightly")]
-    #[inline(always)]
-    fn weights_penalty(&self) -> i32 {
-        use core::simd::prelude::*;
-        let w = i32x4::from_array(self.weights);
-        (((w * w).reduce_sum() >> 18) - 0x8ff).max(0)
-    }
-
-    /// Weights penalty for the encoder's scalefactor search heuristic.
-    #[cfg(not(feature = "nightly"))]
     #[inline(always)]
     fn weights_penalty(&self) -> i32 {
         let w = &self.weights;
@@ -802,14 +778,11 @@ impl QoaLms {
     #[inline(always)]
     fn update(&mut self, sample: i16, residual: i32) {
         let delta = residual >> 4;
-        for i in 0..QOA_LMS_LEN {
-            self.weights[i] += if self.history[i] < 0 { -delta } else { delta };
-        }
-
-        for i in 0..QOA_LMS_LEN - 1 {
-            self.history[i] = self.history[i + 1];
-        }
-        self.history[QOA_LMS_LEN - 1] = sample as i32;
+        self.weights[0] += if self.history[0] < 0 { -delta } else { delta };
+        self.weights[1] += if self.history[1] < 0 { -delta } else { delta };
+        self.weights[2] += if self.history[2] < 0 { -delta } else { delta };
+        self.weights[3] += if self.history[3] < 0 { -delta } else { delta };
+        self.history = [self.history[1], self.history[2], self.history[3], sample as i32];
     }
 }
 
@@ -908,7 +881,7 @@ mod rodio_integration {
                 return match self.decoder.next() {
                     Some(Ok(QoaItem::Sample(s))) => {
                         if self.decoder.next_pending_sample_idx
-                            >= self.decoder.pending_samples.len()
+                            >= self.decoder.pending_samples_end
                             && self.decoder.current_frame.num_samples_per_channel_remaining == 0
                         {
                             // This frame is done. We need to process the next frame header now so

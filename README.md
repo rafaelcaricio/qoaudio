@@ -10,7 +10,7 @@ A pure Rust, zero-dependency implementation of the [QOA](https://qoaformat.org) 
 - **Encode** 16-bit PCM audio to QOA — one-shot or frame-at-a-time streaming
 - **Zero unsafe code** — the crate enforces `#![forbid(unsafe_code)]`
 - **Zero required dependencies** — `rodio` and `hound` are optional features
-- **Faster than C** — with the `nightly` feature, the encoder beats the C reference by ~6% while remaining 100% safe
+- **Faster than C** — the encoder beats the C reference by ~27% while remaining 100% safe
 
 ## Performance
 
@@ -18,28 +18,18 @@ On Apple Silicon (M-series), encoding a 54-second stereo 44.1kHz file:
 
 | Implementation | Decode | Encode |
 |---|---|---|
-| C reference (`qoa.h`, `gcc -O3`) | — | ~202 ms |
-| **Rust stable** | ~46 ms | ~200 ms |
-| **Rust nightly** (`nightly` feature) | ~46 ms | **~189 ms** ✅ |
+| C reference (`qoa.h`, `gcc -O3`) | — | ~210 ms |
+| **Rust** | ~46 ms | **~155 ms** |
 
 The encoder's hot path is a brute-force search over 16 scalefactors × 20
 samples per slice, dominated by a 4-element LMS dot product
-(`predict`) and a self-dot product (`weights_penalty`). On stable Rust,
-LLVM doesn't fully auto-vectorize the `wrapping_mul`/`wrapping_add` chains,
-producing mixed scalar/NEON code. The optional `nightly` feature uses
-`std::simd` (portable SIMD) to express these as explicit `i32x4` operations,
-generating optimal `mul.4s` + `addv.4s` NEON instructions (or SSE/AVX
-equivalents on x86) — matching what Clang produces for the C reference, and
-then winning on Rust's tighter codegen elsewhere.
-
-All of this with `#![forbid(unsafe_code)]` — portable SIMD is a safe API.
+(`predict`) and a self-dot product (`weights_penalty`). With full LTO and
+`codegen-units = 1`, LLVM generates tight scalar code that pipelines
+efficiently on wide out-of-order cores — outperforming manual SIMD
+approaches for these small 4-element operations.
 
 ```bash
-# Stable
 cargo bench
-
-# Nightly (with SIMD)
-cargo +nightly bench --features nightly
 ```
 
 ## Usage

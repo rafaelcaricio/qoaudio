@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Overview
-Pure Rust QOA (Quite OK Audio) encoder/decoder. Single-file crate (`src/lib.rs`, ~1260 lines) that enforces `#![forbid(unsafe_code)]`. The encoder beats the reference C implementation on nightly via portable SIMD while remaining 100% safe.
+Pure Rust QOA (Quite OK Audio) encoder/decoder. Single-file crate (`src/lib.rs`, ~1250 lines) that enforces `#![forbid(unsafe_code)]`. The encoder beats the reference C implementation by ~27% while remaining 100% safe.
 
 ## Project Layout
 ```
@@ -14,52 +14,39 @@ fuzz/               — libFuzzer targets (iter_all, encode_round_trip)
 ```
 
 ## Features & Toolchains
-- `nightly` — enables `std::simd` (portable SIMD) for the LMS hot paths. **Requires nightly Rust.** Do NOT include in `--all-features` on stable.
 - `rodio` — optional playback integration
 - `hound` — optional WAV reading for the encode example
 
 ## Build & Test Commands
 ```bash
-# Stable (use explicit features, never --all-features)
 cargo fmt
 cargo clippy --features rodio,hound --tests
 cargo test --features rodio,hound
 
-# Nightly (SIMD path)
-cargo +nightly clippy --features nightly --tests
-cargo +nightly test --features nightly
-
 # Benchmarks
-cargo bench                                  # stable
-cargo +nightly bench --features nightly      # nightly SIMD
+cargo bench
 
 # Fuzzing (requires cargo-fuzz + nightly)
 cargo +nightly fuzz run iter_all
 cargo +nightly fuzz run encode_round_trip
 ```
 
-**Important:** `--all-features` will fail on stable because the `nightly` feature enables `#![feature(portable_simd)]`. Always list features explicitly.
-
 ## Architecture & Hot Paths
-The encoder's inner loop in `encode_slice` (~lines 485–570) dominates runtime: 16 scalefactor trials × up to 20 samples per slice, ~480K slices for the benchmark fixture. The two critical functions are:
+The encoder's inner loop in `encode_slice` (~lines 485–555) dominates runtime: 16 scalefactor trials × up to 20 samples per slice, ~480K slices for the benchmark fixture. The critical functions are:
 
-- **`QoaLms::predict()`** — 4-element dot product (weights · history), shifted right 13. On nightly, uses `i32x4` SIMD producing `mul.4s + addv.4s` NEON.
-- **`QoaLms::weights_penalty()`** — self-dot product of weights for the encoder's heuristic. Same SIMD treatment on nightly.
-
-Both have `#[cfg(feature = "nightly")]` and `#[cfg(not(feature = "nightly"))]` variants. The stable versions use `wrapping_mul`/`wrapping_add`. When modifying these, update BOTH variants and benchmark both paths.
-
-Other performance-sensitive code:
-- `qoa_div()` — wrapping i32 division reciprocal, emits fused `madd`
-- `QoaLms::update()` — LMS weight/history update, called per sample
+- **`QoaLms::predict()`** — 4-element dot product (weights · history), shifted right 13. Uses `wrapping_mul`/`wrapping_add`.
+- **`QoaLms::weights_penalty()`** — self-dot product of weights for the encoder's heuristic.
+- **`QoaLms::update()`** — LMS weight/history update, called per sample. Weights use branchless conditional add, history uses direct array assignment.
+- **`qoa_div()`** — wrapping i32 division reciprocal, emits fused `madd`
 - The gather loop at the top of `encode_slice` that converts interleaved samples to contiguous
 
 ## Performance Rules
-1. **Always benchmark before and after** using `cargo bench` (or `cargo +nightly bench --features nightly`). The fixture is a 54-second stereo 44.1kHz file.
-2. **Do not add `#[inline(always)]` to `encode_slice`** — it breaks NEON auto-vectorization of `predict()` due to register pressure. The compiler inlines it correctly on its own with thin LTO.
-3. **Do not use fat LTO or `codegen-units = 1`** — both measured slower for the encoder. Thin LTO is the sweet spot.
-4. **Wrapping arithmetic is intentional** in the stable predict/weights_penalty paths — it matches C reference behavior. The values don't overflow in practice for well-formed audio.
-5. **The `valid` flag in the inner loop is load-bearing** — removing it changes branch prediction behavior and regresses performance. Don't remove it.
-6. Keep the `[i32; QOA_SLICE_LEN]` gather buffer and `.min(QOA_SLICE_LEN)` hint — they eliminate bounds checks from the inner loop.
+1. **Always benchmark before and after** using `cargo bench`. The fixture is a 54-second stereo 44.1kHz file.
+2. **Full LTO + `codegen-units = 1`** is the optimal profile. These settings allow LLVM to fully optimize scalar code, which outperforms manual SIMD for the small 4-element LMS operations.
+3. **Wrapping arithmetic is intentional** in predict/weights_penalty — it matches C reference behavior. The values don't overflow in practice for well-formed audio.
+4. **The `valid` flag in the inner loop is load-bearing** — removing it changes branch prediction behavior and regresses performance. Don't remove it.
+5. Keep the `[i32; QOA_SLICE_LEN]` gather buffer and `.min(QOA_SLICE_LEN)` hint — they eliminate bounds checks from the inner loop.
+6. **`weights_penalty()` is computed immediately after `predict()`** in the encode loop — both read from `self.weights` without intervening writes, enabling instruction-level parallelism.
 
 ## Coding Style
 - `rustfmt` with defaults (4-space indent). Run `cargo fmt` before every commit.

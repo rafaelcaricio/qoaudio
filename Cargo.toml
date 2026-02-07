@@ -17,7 +17,6 @@ criterion = "0.3"
 
 [features]
 default = []
-nightly = []
 
 [[example]]
 name = "play"
@@ -39,7 +38,9 @@ name = "qoa_benchmarks"
 harness = false
 
 [profile.release]
-lto = "thin"
+lto = true
+codegen-units = 1
 
 [profile.bench]
-lto = "thin"
+lto = true
+codegen-units = 1
