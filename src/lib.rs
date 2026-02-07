@@ -27,6 +27,11 @@ const QOA_RECIPROCAL_TAB: [i32; 16] = [
     65536, 9363, 3121, 1457, 781, 475, 311, 216, 156, 117, 90, 71, 57, 47, 39, 32,
 ];
 
+// Search around the previous scalefactor first so best_rank converges early
+// and more candidate paths are pruned in the inner loop.
+const QOA_SCALEFACTOR_SEARCH_OFFSETS: [usize; 16] =
+    [0, 1, 15, 2, 14, 3, 13, 4, 12, 5, 11, 6, 10, 7, 9, 8];
+
 /// The decoding mode of the QOA file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessingMode {
@@ -510,8 +515,8 @@ impl QoaEncoder {
         let mut best_scalefactor = 0;
         let mut best_lms = QoaLms::default();
 
-        for sfi in 0..16 {
-            let scalefactor = (sfi + prev_scalefactor) & 15;
+        for offset in QOA_SCALEFACTOR_SEARCH_OFFSETS {
+            let scalefactor = (offset + prev_scalefactor) & 15;
             let sf_dequant = &QOA_DEQUANT_TAB[scalefactor];
 
             let mut lms = channel_lms.clone();
@@ -530,10 +535,8 @@ impl QoaEncoder {
                 let dequantized = sf_dequant[quantized & 7];
                 let reconstructed = (predicted + dequantized).clamp(-32768, 32767);
 
-                let weights_penalty = lms.weights_penalty();
-
                 let error = (sample - reconstructed) as i64;
-                let penalty = weights_penalty as i64;
+                let penalty = lms.weights_penalty() as i64;
                 current_rank += (error * error) as u64 + (penalty * penalty) as u64;
 
                 if current_rank > best_rank {

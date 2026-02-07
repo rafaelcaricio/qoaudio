@@ -10,7 +10,7 @@ A pure Rust, zero-dependency implementation of the [QOA](https://qoaformat.org) 
 - **Encode** 16-bit PCM audio to QOA — one-shot or frame-at-a-time streaming
 - **Zero unsafe code** — the crate enforces `#![forbid(unsafe_code)]`
 - **Zero required dependencies** — `rodio` and `hound` are optional features
-- **Faster than C** — with the `nightly` feature, the encoder beats the C reference by ~2.5% while remaining 100% safe
+- **Faster than C** — with the `nightly` feature, the encoder beats the C reference by ~6% while remaining 100% safe
 
 ## Performance
 
@@ -19,8 +19,8 @@ On Apple Silicon (M-series), encoding a 54-second stereo 44.1kHz file:
 | Implementation | Decode | Encode |
 |---|---|---|
 | C reference (`qoa.h`, `gcc -O3`) | — | ~202 ms |
-| **Rust stable** | ~45 ms | ~206 ms |
-| **Rust nightly** (`nightly` feature) | ~45 ms | **~197 ms** ✅ |
+| **Rust stable** | ~46 ms | ~200 ms |
+| **Rust nightly** (`nightly` feature) | ~46 ms | **~189 ms** ✅ |
 
 The encoder's hot path is a brute-force search over 16 scalefactors × 20
 samples per slice, dominated by a 4-element LMS dot product
