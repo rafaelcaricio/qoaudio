@@ -311,19 +311,21 @@ where
             let mut slice = read_u64_be(&mut self.reader)?;
 
             let scale_factor = ((slice >> 60) & 0xf) as usize;
-            for sample_in_channel_slice_idx in 0..QOA_SLICE_LEN {
-                let prediction = self.lms[channel_idx].predict();
+            let mut lms = self.lms[channel_idx];
+            let mut data_idx = channel_idx;
+            for _ in 0..QOA_SLICE_LEN {
+                let prediction = lms.predict();
                 let quantized = ((slice >> 57) & 0x7) as usize;
                 let dequantized = QOA_DEQUANT_TAB[scale_factor][quantized];
                 let reconstructed = (prediction + dequantized).clamp(-32768, 32767) as i16;
 
-                let data_idx = sample_in_channel_slice_idx * channels + channel_idx;
-
                 self.pending_samples[data_idx] = reconstructed;
+                data_idx += channels;
                 slice <<= 3;
 
-                self.lms[channel_idx].update(reconstructed, dequantized);
+                lms.update(reconstructed, dequantized);
             }
+            self.lms[channel_idx] = lms;
         }
         let num_samples_per_channel = self.current_frame.num_samples_per_channel_remaining;
         if (num_samples_per_channel as usize) < QOA_SLICE_LEN {
@@ -513,7 +515,7 @@ impl QoaEncoder {
 
         for offset in QOA_SCALEFACTOR_SEARCH_OFFSETS {
             let scalefactor = (offset + prev_scalefactor) & 15;
-            let sf_dequant = &QOA_DEQUANT_TAB[scalefactor];
+            let sf_quant_dequant = &QOA_QUANT_DEQUANT_TAB[scalefactor];
 
             let mut lms = *channel_lms;
             let mut slice = scalefactor as u64;
@@ -523,17 +525,17 @@ impl QoaEncoder {
             #[allow(clippy::needless_range_loop)]
             for i in 0..slice_len {
                 let sample = samples[i];
-                let predicted = lms.predict();
-                let penalty = lms.weights_penalty() as i64;
+                let (predicted, penalty_sq) = lms.predict_and_penalty_sq();
                 let residual = sample - predicted;
                 let scaled = qoa_div(residual, scalefactor);
                 let clamped = scaled.clamp(-8, 8);
-                let quantized = QOA_QUANT_TAB[(clamped + 8) as usize] as usize;
-                let dequantized = sf_dequant[quantized & 7];
+                let packed = sf_quant_dequant[(clamped + 8) as usize];
+                let quantized = (packed >> 32) as usize;
+                let dequantized = packed as i32;
                 let reconstructed = (predicted + dequantized).clamp(-32768, 32767);
 
                 let error = (sample - reconstructed) as i64;
-                current_rank += (error * error) as u64 + (penalty * penalty) as u64;
+                current_rank += (error * error) as u64 + penalty_sq;
 
                 if current_rank > best_rank {
                     valid = false;
@@ -757,22 +759,24 @@ fn read_array<R: io::Read, const LEN: usize>(mut reader: R) -> io::Result<[u8; L
 impl QoaLms {
     #[inline(always)]
     fn predict(&self) -> i32 {
-        let mut prediction: i32 = 0;
-        for i in 0..QOA_LMS_LEN {
-            prediction = prediction.wrapping_add(self.weights[i].wrapping_mul(self.history[i]));
-        }
-        prediction >> 13
+        let p01 = self.weights[0].wrapping_mul(self.history[0])
+            .wrapping_add(self.weights[1].wrapping_mul(self.history[1]));
+        let p23 = self.weights[2].wrapping_mul(self.history[2])
+            .wrapping_add(self.weights[3].wrapping_mul(self.history[3]));
+        p01.wrapping_add(p23) >> 13
     }
 
     #[inline(always)]
-    fn weights_penalty(&self) -> i32 {
-        let w = &self.weights;
-        let sq = w[0]
-            .wrapping_mul(w[0])
-            .wrapping_add(w[1].wrapping_mul(w[1]))
-            .wrapping_add(w[2].wrapping_mul(w[2]))
-            .wrapping_add(w[3].wrapping_mul(w[3]));
-        ((sq >> 18) - 0x8ff).max(0)
+    fn predict_and_penalty_sq(&self) -> (i32, u64) {
+        let w = self.weights;
+        let h = self.history;
+        let p01 = w[0].wrapping_mul(h[0]).wrapping_add(w[1].wrapping_mul(h[1]));
+        let p23 = w[2].wrapping_mul(h[2]).wrapping_add(w[3].wrapping_mul(h[3]));
+        let prediction = p01.wrapping_add(p23) >> 13;
+        let s01 = w[0].wrapping_mul(w[0]).wrapping_add(w[1].wrapping_mul(w[1]));
+        let s23 = w[2].wrapping_mul(w[2]).wrapping_add(w[3].wrapping_mul(w[3]));
+        let penalty = ((s01.wrapping_add(s23) >> 18) - 0x8ff).max(0) as i64;
+        (prediction, (penalty * penalty) as u64)
     }
 
     #[inline(always)]
@@ -785,6 +789,22 @@ impl QoaLms {
         self.history = [self.history[1], self.history[2], self.history[3], sample as i32];
     }
 }
+
+const QOA_QUANT_DEQUANT_TAB: [[u64; 17]; 16] = {
+    let mut tab = [[0u64; 17]; 16];
+    let mut sf = 0;
+    while sf < 16 {
+        let mut i = 0;
+        while i < 17 {
+            let quantized = QOA_QUANT_TAB[i] as u64;
+            let dequantized = QOA_DEQUANT_TAB[sf][QOA_QUANT_TAB[i] as usize] as u32 as u64;
+            tab[sf][i] = (quantized << 32) | dequantized;
+            i += 1;
+        }
+        sf += 1;
+    }
+    tab
+};
 
 const QOA_DEQUANT_TAB: [[i32; 8]; 16] = [
     [1, -1, 3, -3, 5, -5, 7, -7],
