@@ -471,12 +471,8 @@ impl QoaEncoder {
                 let slice_start = sample_index * channels + c;
                 let slice_end = (sample_index + slice_len) * channels + c;
 
-                let (best_slice, best_scalefactor, best_lms) = self.encode_slice(
-                    sample_data,
-                    slice_start,
-                    slice_end,
-                    channels,
-                );
+                let (best_slice, best_scalefactor, best_lms) =
+                    self.encode_slice(sample_data, slice_start, slice_end, channels);
 
                 self.prev_scalefactor[c] = best_scalefactor;
                 self.lms[c] = best_lms;
@@ -575,9 +571,7 @@ impl QoaEncoder {
                 let error = (sample - reconstructed) as i64;
                 current_rank += (error * error) as u64 + penalty_sq;
 
-                if current_rank > best_rank
-                    || (i == 10 && current_rank * 2 > best_rank)
-                {
+                if current_rank > best_rank || (i == 10 && current_rank * 2 > best_rank) {
                     valid = false;
                     break;
                 }
@@ -799,9 +793,11 @@ fn read_array<R: io::Read, const LEN: usize>(mut reader: R) -> io::Result<[u8; L
 impl QoaLms {
     #[inline(always)]
     fn predict(&self) -> i32 {
-        let p01 = self.weights[0].wrapping_mul(self.history[0])
+        let p01 = self.weights[0]
+            .wrapping_mul(self.history[0])
             .wrapping_add(self.weights[1].wrapping_mul(self.history[1]));
-        let p23 = self.weights[2].wrapping_mul(self.history[2])
+        let p23 = self.weights[2]
+            .wrapping_mul(self.history[2])
             .wrapping_add(self.weights[3].wrapping_mul(self.history[3]));
         p01.wrapping_add(p23) >> 13
     }
@@ -810,11 +806,19 @@ impl QoaLms {
     fn predict_and_penalty_sq(&self) -> (i32, u64) {
         let w = self.weights;
         let h = self.history;
-        let p01 = w[0].wrapping_mul(h[0]).wrapping_add(w[1].wrapping_mul(h[1]));
-        let p23 = w[2].wrapping_mul(h[2]).wrapping_add(w[3].wrapping_mul(h[3]));
+        let p01 = w[0]
+            .wrapping_mul(h[0])
+            .wrapping_add(w[1].wrapping_mul(h[1]));
+        let p23 = w[2]
+            .wrapping_mul(h[2])
+            .wrapping_add(w[3].wrapping_mul(h[3]));
         let prediction = p01.wrapping_add(p23) >> 13;
-        let s01 = w[0].wrapping_mul(w[0]).wrapping_add(w[1].wrapping_mul(w[1]));
-        let s23 = w[2].wrapping_mul(w[2]).wrapping_add(w[3].wrapping_mul(w[3]));
+        let s01 = w[0]
+            .wrapping_mul(w[0])
+            .wrapping_add(w[1].wrapping_mul(w[1]));
+        let s23 = w[2]
+            .wrapping_mul(w[2])
+            .wrapping_add(w[3].wrapping_mul(w[3]));
         let penalty = ((s01.wrapping_add(s23) >> 18) - 0x8ff).max(0) as i64;
         (prediction, (penalty * penalty) as u64)
     }
@@ -826,7 +830,12 @@ impl QoaLms {
         self.weights[1] += if self.history[1] < 0 { -delta } else { delta };
         self.weights[2] += if self.history[2] < 0 { -delta } else { delta };
         self.weights[3] += if self.history[3] < 0 { -delta } else { delta };
-        self.history = [self.history[1], self.history[2], self.history[3], sample as i32];
+        self.history = [
+            self.history[1],
+            self.history[2],
+            self.history[3],
+            sample as i32,
+        ];
     }
 }
 
@@ -940,8 +949,7 @@ mod rodio_integration {
             loop {
                 return match self.decoder.next() {
                     Some(Ok(QoaItem::Sample(s))) => {
-                        if self.decoder.next_pending_sample_idx
-                            >= self.decoder.pending_samples_end
+                        if self.decoder.next_pending_sample_idx >= self.decoder.pending_samples_end
                             && self.decoder.current_frame.num_samples_per_channel_remaining == 0
                         {
                             // This frame is done. We need to process the next frame header now so
