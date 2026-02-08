@@ -344,8 +344,8 @@ impl QoaEncoder {
         }
 
         let mut lms = [QoaLms::default(); QOA_MAX_CHANNELS];
-        for c in 0..desc.channels as usize {
-            lms[c] = QoaLms {
+        for lms in lms.iter_mut().take(desc.channels as usize) {
+            *lms = QoaLms {
                 history: [0; QOA_LMS_LEN],
                 weights: [0, 0, -(1 << 13), 1 << 14],
             };
@@ -530,7 +530,7 @@ impl QoaEncoder {
             let reconstructed = (first_predicted + dequantized).clamp(-32768, 32767);
             let error = (first_sample - reconstructed) as i64;
             let rank = (error * error) as u64 + first_penalty_sq;
-            first_sample_results[sf] = (packed, reconstructed as i32, quantized, rank);
+            first_sample_results[sf] = (packed, reconstructed, quantized, rank);
 
             let mut pos = sf_count;
             while pos > 0 && first_sample_results[sf_order[pos - 1] as usize].3 > rank {
@@ -541,7 +541,7 @@ impl QoaEncoder {
             sf_count += 1;
         }
 
-        for &scalefactor_u8 in &sf_order {
+        for &scalefactor_u8 in &sf_order[..sf_count] {
             let scalefactor = scalefactor_u8 as usize;
             let sf_quant_dequant = &QOA_QUANT_DEQUANT_TAB[scalefactor];
 
@@ -575,7 +575,9 @@ impl QoaEncoder {
                 let error = (sample - reconstructed) as i64;
                 current_rank += (error * error) as u64 + penalty_sq;
 
-                if current_rank > best_rank {
+                if current_rank > best_rank
+                    || (i == 10 && current_rank * 2 > best_rank)
+                {
                     valid = false;
                     break;
                 }

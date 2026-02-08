@@ -10,7 +10,7 @@ A pure Rust, zero-dependency implementation of the [QOA](https://qoaformat.org) 
 - **Encode** 16-bit PCM audio to QOA — one-shot or frame-at-a-time streaming
 - **Zero unsafe code** — the crate enforces `#![forbid(unsafe_code)]`
 - **Zero required dependencies** — `rodio` and `hound` are optional features
-- **Faster than C** — the encoder beats the C reference by ~45% while remaining 100% safe
+- **Faster than C** — the encoder beats the C reference by ~56% while remaining 100% safe
 
 ## Performance
 
@@ -19,7 +19,7 @@ On Apple Silicon (M-series), encoding a 54-second stereo 44.1kHz file:
 | Implementation | Decode | Encode |
 |---|---|---|
 | C reference (`qoa.h`, `gcc -O3`) | — | ~210 ms |
-| **Rust** | **~25 ms** | **~116 ms** |
+| **Rust** | **~24 ms** | **~93 ms** |
 
 The encoder's hot path is a brute-force search over 16 scalefactors × 20
 samples per slice. Key optimizations include a combined 4-element LMS
@@ -27,11 +27,12 @@ prediction and weights-penalty computation that shares register loads, a
 compile-time combined quantize+dequantize lookup table that eliminates a
 serialized load dependency in the inner loop, precomputation of first-sample
 results for all scalefactors with rank-sorted search order that breaks early
-once no better scalefactor is possible, and direct buffer writes bypassing
-`io::Write` trait overhead. With full LTO and `codegen-units = 1`, LLVM
-generates tight scalar code that pipelines efficiently on wide out-of-order
-cores — outperforming manual SIMD approaches for these small 4-element
-operations.
+once no better scalefactor is possible, proportional early rejection of
+underperforming scalefactors at the halfway point, and direct buffer writes
+bypassing `io::Write` trait overhead. With full LTO and `codegen-units = 1`,
+LLVM generates tight scalar code that pipelines efficiently on wide
+out-of-order cores — outperforming manual SIMD approaches for these small
+4-element operations.
 
 ```bash
 cargo bench
