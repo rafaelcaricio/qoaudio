@@ -33,6 +33,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("decode_all_sprained_ankle", |b| {
+        b.iter(|| {
+            let decoded = qoaudio::decode_all(std::io::Cursor::new(black_box(QOA_BYTES))).unwrap();
+            assert_eq!(decoded.samples.len(), 2394122 * 2);
+            black_box(decoded.samples);
+        })
+    });
+
     // Decode once to get PCM samples for encoding benchmark
     let decoded = qoaudio::decode_all(std::io::Cursor::new(QOA_BYTES)).unwrap();
     let desc = qoaudio::QoaDesc {

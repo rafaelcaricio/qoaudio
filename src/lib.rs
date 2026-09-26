@@ -797,31 +797,42 @@ pub struct DecodedQoa {
 pub fn decode_all<R: io::Read>(reader: R) -> Result<DecodedQoa, DecodeError> {
     let mut decoder = QoaDecoder::new(reader)?;
     let mut samples = Vec::new();
-    if let &ProcessingMode::FixedSamples {
-        samples: samples_per_channel,
-        channels,
-        ..
-    } = decoder.mode()
-    {
-        samples.reserve_exact(samples_per_channel as usize * channels as usize);
+    match *decoder.mode() {
+        ProcessingMode::FixedSamples {
+            samples: samples_per_channel,
+            channels,
+            ..
+        } => samples.reserve_exact(samples_per_channel as usize * channels as usize),
+        // No frame header has been read yet in streaming mode
+        ProcessingMode::Streaming => {
+            if decoder.next_frame()?.is_none() {
+                return Err(DecodeError::NoSamples);
+            }
+        }
     }
-    let QoaItem::FrameHeader(FrameHeader {
+    let FrameHeader {
         num_channels,
         sample_rate,
         ..
-    }) = decoder.next().unwrap()?
-    else {
-        unreachable!();
-    };
-    for item in decoder {
-        match item? {
-            QoaItem::Sample(s) => samples.push(s),
-            QoaItem::FrameHeader(header) => {
-                if num_channels != header.num_channels || sample_rate != header.sample_rate {
-                    return Err(DecodeError::IncompatibleFrame);
+    } = *decoder.current_frame_header();
+    // A multiple of the slice length for every channel so decode_into can
+    // always decode directly into the buffer.
+    let mut buf = [0_i16; 4096];
+    let buf_len = buf.len() - buf.len() % (QOA_SLICE_LEN * num_channels as usize);
+    let buf = &mut buf[..buf_len];
+    loop {
+        let written = decoder.decode_into(buf)?;
+        if written == 0 {
+            match decoder.next_frame()? {
+                Some(header) => {
+                    if num_channels != header.num_channels || sample_rate != header.sample_rate {
+                        return Err(DecodeError::IncompatibleFrame);
+                    }
                 }
+                None => break,
             }
         }
+        samples.extend_from_slice(&buf[..written]);
     }
     Ok(DecodedQoa {
         num_channels,
@@ -1169,6 +1180,7 @@ mod tests {
         assert_eq!(decoded.sample_rate, 44100);
         assert_eq!(decoded.num_channels, 2);
         assert_eq!(decoded.samples.len(), 2394122 * 2);
+        assert!(decoded.samples == decode_all_with_iterator());
     }
 
     #[test]
@@ -1394,6 +1406,17 @@ mod tests {
         assert_eq!(streamed, oneshot);
     }
 
+    /// Decode all samples of the fixture with the iterator.
+    fn decode_all_with_iterator() -> Vec<i16> {
+        QoaDecoder::new(Cursor::new(QOA_BYTES))
+            .unwrap()
+            .filter_map(|item| match item.unwrap() {
+                QoaItem::Sample(s) => Some(s),
+                QoaItem::FrameHeader(_) => None,
+            })
+            .collect()
+    }
+
     /// Decode the whole file with decode_into using buffers of `buf_len`.
     fn decode_all_with_decode_into(buf_len: usize) -> (Vec<i16>, usize) {
         let mut qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
@@ -1418,7 +1441,7 @@ mod tests {
 
     #[test]
     fn test_decode_into_matches_iterator() {
-        let expected = decode_all(Cursor::new(QOA_BYTES)).unwrap().samples;
+        let expected = decode_all_with_iterator();
         for buf_len in [1, 2, 7, 14, 40, 41, 4096, 20_000] {
             let (samples, frames) = decode_all_with_decode_into(buf_len);
             assert_eq!(frames, 468, "buf_len {buf_len}");
@@ -1428,7 +1451,7 @@ mod tests {
 
     #[test]
     fn test_decode_into_mixed_with_iterator() {
-        let expected = decode_all(Cursor::new(QOA_BYTES)).unwrap().samples;
+        let expected = decode_all_with_iterator();
         let mut qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
         let mut samples = Vec::new();
         let mut buf = [0; 33];
@@ -1458,7 +1481,7 @@ mod tests {
 
     #[test]
     fn test_next_frame_skips_rest_of_frame() {
-        let expected = decode_all(Cursor::new(QOA_BYTES)).unwrap().samples;
+        let expected = decode_all_with_iterator();
         let mut qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
         let mut buf = [0; 100];
         assert_eq!(qoa.decode_into(&mut buf).unwrap(), 100);
@@ -1488,5 +1511,22 @@ mod tests {
         assert_eq!(header.num_channels, 2);
         assert_eq!(qoa.decode_into(&mut buf).unwrap(), 5120 * 2);
         assert_eq!(qoa.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn test_decode_all_streaming() {
+        let frame_header =
+            read_u64_be(Cursor::new(QOA_BYTES[QOA_HEADER_SIZE..16].to_vec())).unwrap();
+        let first_frame_end = 8 + (frame_header & 0x00ffff) as usize;
+        let mut streaming_bytes: Vec<u8> = [QOA_MAGIC, 0]
+            .iter()
+            .flat_map(|&x| x.to_be_bytes())
+            .collect();
+        streaming_bytes.extend_from_slice(&QOA_BYTES[QOA_HEADER_SIZE..first_frame_end]);
+
+        let decoded = decode_all(Cursor::new(streaming_bytes)).unwrap();
+        assert_eq!(decoded.num_channels, 2);
+        assert_eq!(decoded.sample_rate, 44100);
+        assert!(decoded.samples == decode_all_with_iterator()[..5120 * 2]);
     }
 }
