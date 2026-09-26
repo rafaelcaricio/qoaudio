@@ -288,28 +288,118 @@ where
         Ok(true)
     }
 
+    /// Decode samples of the current frame directly into `buf`.
+    ///
+    /// This is a faster alternative to iterating one sample at a time. Samples
+    /// are interleaved by channel. Returns the number of samples written. Only
+    /// samples of the current frame are written. If `buf.len()` is a multiple
+    /// of the number of channels of the current frame, the number of samples
+    /// written is too.
+    ///
+    /// Returns `Ok(0)` (for a non-empty `buf`) once all samples of the current
+    /// frame have been returned. Call [`QoaDecoder::next_frame`] to continue
+    /// with the next frame, which may have a different number of channels or
+    /// sample rate in streaming mode.
+    ///
+    /// Decoding with `decode_into` and iterating can be mixed. Samples are
+    /// returned exactly once either way. The first frame header is not
+    /// returned by the iterator after `decode_into` or `next_frame` is called;
+    /// it is available from [`QoaDecoder::current_frame_header`].
+    pub fn decode_into(&mut self, buf: &mut [i16]) -> Result<usize, DecodeError> {
+        self.returned_first_frame_header = true;
+        let channels = self.current_frame.header.num_channels as usize;
+        let full_slices_num_samples = QOA_SLICE_LEN * channels;
+
+        // First return samples from a previously decoded slice.
+        let num_pending = self.pending_samples_end - self.next_pending_sample_idx;
+        let mut written = num_pending.min(buf.len());
+        buf[..written].copy_from_slice(
+            &self.pending_samples
+                [self.next_pending_sample_idx..self.next_pending_sample_idx + written],
+        );
+        self.next_pending_sample_idx += written;
+
+        while written < buf.len() && self.current_frame.num_samples_per_channel_remaining > 0 {
+            let remaining = &mut buf[written..];
+            if remaining.len() >= full_slices_num_samples {
+                // Decode directly into the output.
+                written += self
+                    .decode_one_slice_per_channel_into(&mut remaining[..full_slices_num_samples])?;
+            } else {
+                self.decode_one_slice_per_channel()?;
+                let to_copy = self.pending_samples_end.min(remaining.len());
+                remaining[..to_copy].copy_from_slice(&self.pending_samples[..to_copy]);
+                self.next_pending_sample_idx = to_copy;
+                written += to_copy;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Read the header of the next frame so its samples can be decoded with
+    /// [`QoaDecoder::decode_into`].
+    ///
+    /// Any samples of the current frame that have not been returned yet are
+    /// skipped. Returns `Ok(None)` at the end of the file. In streaming mode
+    /// [`QoaDecoder::new`] does not read a frame header, so `decode_into`
+    /// returns `Ok(0)` until this is called.
+    pub fn next_frame(&mut self) -> Result<Option<FrameHeader>, DecodeError> {
+        self.returned_first_frame_header = true;
+        let mut scratch = [0_i16; 1024];
+        while self.current_frame.num_samples_per_channel_remaining > 0
+            || self.next_pending_sample_idx < self.pending_samples_end
+        {
+            let channels = (self.current_frame.header.num_channels as usize).max(1);
+            let len = scratch.len() - scratch.len() % channels;
+            self.decode_into(&mut scratch[..len])?;
+        }
+        if self.decode_frame_header_and_lms(false)? {
+            Ok(Some(self.current_frame.header))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Decode one slice per channel into `pending_samples`.
     fn decode_one_slice_per_channel(&mut self) -> Result<(), DecodeError> {
         assert!(self.next_pending_sample_idx >= self.pending_samples_end);
         let channels = self.current_frame.header.num_channels as usize;
         let full_slices_num_samples = QOA_SLICE_LEN * channels;
-        if self.pending_samples.len() != full_slices_num_samples {
-            self.pending_samples = vec![0_i16; full_slices_num_samples].into_boxed_slice();
+        let mut pending = std::mem::take(&mut self.pending_samples);
+        if pending.len() != full_slices_num_samples {
+            pending = vec![0_i16; full_slices_num_samples].into_boxed_slice();
         }
+        let result = self.decode_one_slice_per_channel_into(&mut pending);
+        self.pending_samples = pending;
         self.next_pending_sample_idx = 0;
+        // Do not return stale samples after an error
+        self.pending_samples_end = *result.as_ref().unwrap_or(&0);
+        result.map(|_| ())
+    }
+
+    /// Decode one slice per channel into `out` which must have room for
+    /// exactly one slice for every channel. Returns the number of valid
+    /// samples which is less than `out.len()` for the last slice of a frame
+    /// that is not a multiple of the slice length.
+    #[inline]
+    fn decode_one_slice_per_channel_into(&mut self, out: &mut [i16]) -> Result<usize, DecodeError> {
+        let channels = self.current_frame.header.num_channels as usize;
+        assert_eq!(out.len(), QOA_SLICE_LEN * channels);
 
         for channel_idx in 0..channels {
             let mut slice = read_u64_be(&mut self.reader)?;
 
             let scale_factor = ((slice >> 60) & 0xf) as usize;
+            let dequant_tab = &QOA_DEQUANT_TAB[scale_factor];
             let mut lms = self.lms[channel_idx];
             let mut data_idx = channel_idx;
             for _ in 0..QOA_SLICE_LEN {
                 let prediction = lms.predict();
                 let quantized = ((slice >> 57) & 0x7) as usize;
-                let dequantized = QOA_DEQUANT_TAB[scale_factor][quantized];
+                let dequantized = dequant_tab[quantized];
                 let reconstructed = (prediction + dequantized).clamp(-32768, 32767) as i16;
 
-                self.pending_samples[data_idx] = reconstructed;
+                out[data_idx] = reconstructed;
                 data_idx += channels;
                 slice <<= 3;
 
@@ -317,16 +407,14 @@ where
             }
             self.lms[channel_idx] = lms;
         }
-        let num_samples_per_channel = self.current_frame.num_samples_per_channel_remaining;
-        if (num_samples_per_channel as usize) < QOA_SLICE_LEN {
-            let total_num_samples = num_samples_per_channel as usize * channels;
-            self.pending_samples_end = total_num_samples;
-            self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel;
-        } else {
-            self.pending_samples_end = full_slices_num_samples;
-            self.current_frame.num_samples_per_channel_remaining -= QOA_SLICE_LEN as u16;
-        }
-        Ok(())
+        // The last slice of a frame might not have all 20 samples and be zero
+        // filled. The excess samples are ignored.
+        let num_samples_per_channel = self
+            .current_frame
+            .num_samples_per_channel_remaining
+            .min(QOA_SLICE_LEN as u16);
+        self.current_frame.num_samples_per_channel_remaining -= num_samples_per_channel;
+        Ok(num_samples_per_channel as usize * channels)
     }
 }
 
@@ -766,7 +854,7 @@ struct CurrentFrame {
 }
 
 /// The metadata at the beginning of each frame of slices.
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct FrameHeader {
     /// Number of channels in this frame
     pub num_channels: u8,
@@ -1304,5 +1392,101 @@ mod tests {
         }
 
         assert_eq!(streamed, oneshot);
+    }
+
+    /// Decode the whole file with decode_into using buffers of `buf_len`.
+    fn decode_all_with_decode_into(buf_len: usize) -> (Vec<i16>, usize) {
+        let mut qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
+        let mut buf = vec![0; buf_len];
+        let mut samples = Vec::new();
+        let mut frames = 1;
+        loop {
+            let written = qoa.decode_into(&mut buf).unwrap();
+            samples.extend_from_slice(&buf[..written]);
+            if written == 0 {
+                match qoa.next_frame().unwrap() {
+                    Some(header) => {
+                        assert_eq!(header, *qoa.current_frame_header());
+                        frames += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        (samples, frames)
+    }
+
+    #[test]
+    fn test_decode_into_matches_iterator() {
+        let expected = decode_all(Cursor::new(QOA_BYTES)).unwrap().samples;
+        for buf_len in [1, 2, 7, 14, 40, 41, 4096, 20_000] {
+            let (samples, frames) = decode_all_with_decode_into(buf_len);
+            assert_eq!(frames, 468, "buf_len {buf_len}");
+            assert!(samples == expected, "buf_len {buf_len}");
+        }
+    }
+
+    #[test]
+    fn test_decode_into_mixed_with_iterator() {
+        let expected = decode_all(Cursor::new(QOA_BYTES)).unwrap().samples;
+        let mut qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
+        let mut samples = Vec::new();
+        let mut buf = [0; 33];
+        loop {
+            let written = qoa.decode_into(&mut buf).unwrap();
+            samples.extend_from_slice(&buf[..written]);
+            // Pull a few samples through the iterator too. It returns frame
+            // headers at frame boundaries.
+            let mut done = false;
+            for _ in 0..3 {
+                match qoa.next() {
+                    Some(Ok(QoaItem::Sample(s))) => samples.push(s),
+                    Some(Ok(QoaItem::FrameHeader(_))) => (),
+                    Some(Err(e)) => panic!("{e}"),
+                    None => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        assert!(samples == expected);
+    }
+
+    #[test]
+    fn test_next_frame_skips_rest_of_frame() {
+        let expected = decode_all(Cursor::new(QOA_BYTES)).unwrap().samples;
+        let mut qoa = QoaDecoder::new(Cursor::new(QOA_BYTES)).unwrap();
+        let mut buf = [0; 100];
+        assert_eq!(qoa.decode_into(&mut buf).unwrap(), 100);
+        assert_eq!(&buf[..], &expected[..100]);
+        qoa.next_frame().unwrap().unwrap();
+        // The first frame has 5120 samples per channel
+        assert_eq!(qoa.decode_into(&mut buf).unwrap(), 100);
+        assert_eq!(&buf[..], &expected[5120 * 2..5120 * 2 + 100]);
+    }
+
+    #[test]
+    fn test_decode_into_streaming() {
+        let frame_header =
+            read_u64_be(Cursor::new(QOA_BYTES[QOA_HEADER_SIZE..16].to_vec())).unwrap();
+        let first_frame_end = 8 + (frame_header & 0x00ffff) as usize;
+        let mut streaming_bytes: Vec<u8> = [QOA_MAGIC, 0]
+            .iter()
+            .flat_map(|&x| x.to_be_bytes())
+            .collect();
+        streaming_bytes.extend_from_slice(&QOA_BYTES[QOA_HEADER_SIZE..first_frame_end]);
+
+        let mut qoa = QoaDecoder::new(Cursor::new(streaming_bytes)).unwrap();
+        let mut buf = vec![0; 20_000];
+        // No frame header has been read yet in streaming mode
+        assert_eq!(qoa.decode_into(&mut buf).unwrap(), 0);
+        let header = qoa.next_frame().unwrap().unwrap();
+        assert_eq!(header.num_channels, 2);
+        assert_eq!(qoa.decode_into(&mut buf).unwrap(), 5120 * 2);
+        assert_eq!(qoa.next_frame().unwrap(), None);
     }
 }
