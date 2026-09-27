@@ -6,7 +6,7 @@ A pure Rust, zero-dependency implementation of the [QOA](https://qoaformat.org) 
 
 ## Features
 
-- **Decode** QOA files from any `io::Read` source — streaming, one sample at a time
+- **Decode** QOA files from any `io::Read` source — streaming, one sample at a time or directly into a buffer
 - **Encode** 16-bit PCM audio to QOA — one-shot or frame-at-a-time streaming
 - **Zero unsafe code** — the crate enforces `#![forbid(unsafe_code)]`
 - **Zero required dependencies** — `rodio` and `hound` are optional features
@@ -42,6 +42,8 @@ cargo bench
 
 ### Decoding
 
+Samples can be decoded one at a time using `QoaDecoder`'s `Iterator` implementation.
+
 ```rust
 use qoaudio::{QoaDecoder, QoaItem};
 use std::io::BufReader;
@@ -53,6 +55,31 @@ for item in decoder {
     match item.unwrap() {
         QoaItem::Sample(s) => { /* process i16 sample */ }
         QoaItem::FrameHeader(h) => { /* new frame: h.num_channels, h.sample_rate */ }
+    }
+}
+```
+
+Alternatively, many samples can be decoded in a batch buffer using `decode_into`
+and `next_frame` for increased efficiency.
+
+```rust
+use qoaudio::QoaDecoder;
+use std::io::BufReader;
+use std::fs::File;
+
+let file = File::open("audio.qoa").unwrap();
+let mut decoder = QoaDecoder::new(BufReader::new(file)).unwrap();
+let mut buf = [0_i16; 1024];
+loop {
+    // Only samples of the current frame are written
+    let written = decoder.decode_into(&mut buf).unwrap();
+    /* process buf[..written] (interleaved by channel) */
+    if written == 0 {
+        // The frame is done. Frames can change channel count or sample rate
+        // in streaming mode.
+        let Some(_header) = decoder.next_frame().unwrap() else {
+            break;
+        };
     }
 }
 ```
