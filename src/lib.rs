@@ -1,13 +1,23 @@
+#![no_std]
 #![forbid(unsafe_code)]
+#![forbid(clippy::std_instead_of_core)]
+#![forbid(clippy::std_instead_of_alloc)]
 //! # QOA - Quite OK Audio Format
 //!
 //! A library for encoding and decoding qoa files.
-use std::fmt::Display;
+
+extern crate alloc;
+
+// The current crate is not `no_std` yet because it relies on `std::io`.
+// This is why `std` is unconditionally declared.
+extern crate std;
+
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use std::fs::File;
-use std::io::Cursor;
+use std::io;
 use std::path::Path;
-use std::time::Duration;
-use std::{fmt, io};
 
 pub const QOA_SLICE_LEN: usize = 20;
 pub const QOA_LMS_LEN: usize = 4;
@@ -187,13 +197,13 @@ where
         &self.current_frame.header
     }
 
-    pub fn total_duration(&self) -> Option<Duration> {
+    pub fn total_duration(&self) -> Option<core::time::Duration> {
         match &self.mode {
             ProcessingMode::FixedSamples {
                 channels: _channels,
                 sample_rate,
                 samples,
-            } => Some(Duration::from_secs_f64(
+            } => Some(core::time::Duration::from_secs_f64(
                 (*samples as f64) / (*sample_rate as f64),
             )),
             ProcessingMode::Streaming => None,
@@ -365,7 +375,7 @@ where
         assert!(self.next_pending_sample_idx >= self.pending_samples_end);
         let channels = self.current_frame.header.num_channels as usize;
         let full_slices_num_samples = QOA_SLICE_LEN * channels;
-        let mut pending = std::mem::take(&mut self.pending_samples);
+        let mut pending = core::mem::take(&mut self.pending_samples);
         if pending.len() != full_slices_num_samples {
             pending = vec![0_i16; full_slices_num_samples].into_boxed_slice();
         }
@@ -708,7 +718,7 @@ impl QoaDecoder<io::BufReader<File>> {
     }
 }
 
-impl QoaDecoder<Cursor<Vec<u8>>> {
+impl QoaDecoder<io::Cursor<Vec<u8>>> {
     /// Create a new decoder for use in streaming mode.
     ///
     /// This allows for decoding a single frame at a time. This is useful for
@@ -718,7 +728,7 @@ impl QoaDecoder<Cursor<Vec<u8>>> {
             .iter()
             .flat_map(|&x| x.to_be_bytes())
             .collect();
-        QoaDecoder::new(Cursor::new(streaming_header))
+        QoaDecoder::new(io::Cursor::new(streaming_header))
     }
 
     /// Decode a single frame in streaming mode.
@@ -982,10 +992,10 @@ pub enum DecodeError {
     IoError(io::Error),
 }
 
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 
-impl Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             DecodeError::NotQoaFile => write!(f, "File is not a qoa file"),
             DecodeError::NoSamples => write!(f, "File has no samples"),
@@ -1002,10 +1012,10 @@ impl From<io::Error> for DecodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
-impl Display for EncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             EncodeError::InvalidChannels => write!(f, "Invalid number of channels (must be 1-8)"),
             EncodeError::InvalidSampleRate => write!(f, "Invalid sample rate (must be > 0)"),
@@ -1091,7 +1101,7 @@ mod rodio_integration {
             self.decoder.current_frame.header.sample_rate
         }
 
-        fn total_duration(&self) -> Option<Duration> {
+        fn total_duration(&self) -> Option<core::time::Duration> {
             self.decoder.total_duration()
         }
     }
